@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>QFusion</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="hero">
+        <div>
+          <h1>QFusion</h1>
+          <p class="summary">
+            A Demonstration for QUBO Construction, Decomposition, Fusion Planning and Execution <br>
+            Solving Database Optimization Problems: Join Order, Multiple Query Optimization, and Index Selection
+          </p>
+        </div>
+        <div class="hero-badge">VLDB 2026 Demo</div>
+      </header>
+
+      <section class="controls">
+        <label>
+          <span>Problem</span>
+          <select id="problemSelect"></select>
+        </label>
+        <label>
+          <span>Problem Size</span>
+          <input id="scaleSlider" type="range" min="3" max="8" value="8" />
+          <strong id="scaleValue">8</strong>
+        </label>
+        <label class="toggle">
+          <span>QUBO View</span>
+          <div class="segmented">
+            <button id="graphModeBtn" class="active" type="button">Graph</button>
+            <button id="matrixModeBtn" type="button">Matrix</button>
+          </div>
+        </label>
+        <button id="refreshBtn" class="primary" type="button">Construct</button>
+      </section>
+
+      <main class="page-stack">
+        <section class="scenario">
+          <div class="scenario-header">
+            <div>
+              <p class="scenario-tag">Scenario 1</p>
+              <h2>Construction</h2>
+            </div>
+            <p id="quboSubtitle" class="scenario-summary"></p>
+          </div>
+          <div class="scenario-grid construction-grid">
+            <section class="panel construction-panel">
+              <div class="panel-title">
+                <h3>QUBO Structure</h3>
+                <p>See the QUBO as a graph or matrix.</p>
+              </div>
+              <div id="leftCanvas" class="canvas construction-canvas"></div>
+            </section>
+            <section class="panel construction-panel">
+              <div class="panel-title">
+                <h3>DB Structure</h3>
+                <p>See what the variables mean in the database problem.</p>
+              </div>
+              <div id="constructionState" class="state-strip"></div>
+              <div class="semantic-columns semantic-columns-2">
+                <section class="semantic-column">
+                  <div class="column-header">
+                    <h4>Construction Blocks</h4>
+                    <p>Click one block to focus on that part of the QUBO.</p>
+                  </div>
+                  <div id="constructionBlocks" class="block-grid"></div>
+                </section>
+                <section class="semantic-column">
+                  <div class="column-header">
+                    <h4>DB Semantics</h4>
+                    <p>Open a category to inspect its QUBO variables.</p>
+                  </div>
+                  <div id="dbSummary" class="structure-summary"></div>
+                  <div id="dbStructure" class="list-grid"></div>
+                </section>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="scenario">
+          <div class="scenario-header">
+            <div>
+              <p class="scenario-tag">Scenario 2</p>
+              <h2>Decomposition and Boundary</h2>
+            </div>
+            <p class="scenario-summary">Inspect QUBO is split into multiple partitions and corresponding cut boundaries.</p>
+          </div>
+          <div class="scenario-grid boundary-top-grid">
+            <section class="panel">
+              <div class="panel-title">
+                <h3>Partitioned QUBO</h3>
+                <p>A partition-focused circular view of the same QUBO input, recolored to show how decomposition cuts the graph.</p>
+              </div>
+              <div id="boundaryCanvas" class="canvas boundary-canvas"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-title">
+                <h3>Partition Control</h3>
+                <p>Control the number of partitions and inspect the resulting subproblem sizes.</p>
+              </div>
+              <div class="inline-controls">
+                <label>
+                  <span>Partitions</span>
+                  <input id="partitionSlider" type="range" min="2" max="8" value="7" />
+                  <strong id="partitionValue">7</strong>
+                </label>
+              </div>
+              <div id="partitionCards" class="partition-grid"></div>
+            </section>
+          </div>
+          <div class="scenario-grid boundary-bottom-grid">
+            <section class="panel">
+              <div class="panel-title">
+                <h3>Boundary Groups</h3>
+                <p>Boundary edges are grouped by partition pairs.</p>
+              </div>
+              <div id="boundaryGroups" class="list-grid"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="scenario">
+          <div class="scenario-header">
+            <div>
+              <p class="scenario-tag">Scenario 3</p>
+              <h2>Fusion Planning and Execution</h2>
+            </div>
+            <p class="scenario-summary">Select Fusion Strategy, Merge Order and Trigger Planning.</p>
+          </div>
+          <div class="scenario-grid merge-top-grid">
+            <section class="panel">
+              <div class="panel-title">
+                <h3>Fusion Tree</h3>
+                <p>Planned fusion order over the current partitions.</p>
+              </div>
+              <svg id="mergeTree" class="chart merge-tree" viewBox="0 0 520 280"></svg>
+              <div id="mergeTreeNote" class="step-meta"></div>
+              <div class="panel-title merge-subtitle">
+                <h3>Fusion Steps</h3>
+                <p>Per-step scope, energy, conflicts, and runtime.</p>
+              </div>
+              <div id="mergeSteps" class="step-list"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-title">
+                <h3>Fusion Controls</h3>
+                <p>Select one fusion strategy from the original pipeline, then trigger actual execution.</p>
+              </div>
+              <div class="inline-controls merge-controls">
+                <label>
+                  <span>Fusion Strategy</span>
+                  <select id="mergeStrategySelect"></select>
+                </label>
+                <label>
+                  <span>Merge Order</span>
+                  <select id="mergeOrderSelect"></select>
+                </label>
+              </div>
+              <div class="inline-controls merge-actions">
+                <button id="planBtn" type="button">Plan</button>
+                <button id="mergeBtn" class="primary" type="button">Fusion</button>
+              </div>
+              <div id="strategyNote" class="state-card"></div>
+              <div id="metricsGrid" class="metrics-grid"></div>
+            </section>
+          </div>
+          <div class="scenario-grid merge-bottom-grid">
+            <section class="panel">
+              <div class="panel-title">
+                <h3>Execution Time</h3>
+                <p>Actual runtime from the executed fusion.</p>
+              </div>
+              <svg id="energyChart" class="chart" viewBox="0 0 320 170"></svg>
+            </section>
+            <section class="panel">
+              <div class="panel-title">
+                <h3>Result Summary</h3>
+                <p>Final energy and conflict statistics.</p>
+              </div>
+              <svg id="conflictChart" class="chart" viewBox="0 0 320 170"></svg>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
