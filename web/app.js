@@ -158,7 +158,7 @@ async function planFusionTree() {
 
 async function runFusion() {
   el.mergeBtn.disabled = true;
-  el.mergeBtn.textContent = "Running D-Wave...";
+  el.mergeBtn.textContent = "Running...";
   await loadPayload();
   const params = new URLSearchParams({
     problem: el.problemSelect.value || "join_order",
@@ -511,7 +511,7 @@ function renderJoinOrderLayeredGraph() {
     sub.setAttribute("font-size", "11");
     sub.setAttribute("font-family", "Trebuchet MS, sans-serif");
     sub.setAttribute("fill", "#6d695e");
-    sub.textContent = `Variables tag ${displayJoinTag(joinIndex)}`;
+    sub.textContent = `Variable tag ${displayJoinTag(joinIndex)}`;
     svg.appendChild(sub);
   });
 
@@ -1041,17 +1041,6 @@ function renderFamilySummary(summary) {
   `).join("");
 }
 
-function renderAccordion(title, items) {
-  return `
-    <details class="accordion" open>
-      <summary>${title}</summary>
-      <div class="accordion-body">
-        ${items.map((item) => `<div class="semantic-pill">${item}</div>`).join("")}
-      </div>
-    </details>
-  `;
-}
-
 function renderJoinOrderSemanticAccordion(title, items, semanticType, activeSemantic) {
   const isOpen = !activeSemantic || activeSemantic.type === semanticType;
   return `
@@ -1454,7 +1443,7 @@ function renderMergeTree() {
   const plannerLabel = friendlyPlannerModeName(state.payload.merge_plan?.planner_mode || selectedPlannerMode());
   const changedCount = changedSteps.size;
   const summary = state.fusionResult?.supported
-    ? `${plannerLabel} ${orderLabel.toLowerCase()} tree executed with the selected D-Wave fusion strategy.`
+    ? `${plannerLabel} ${orderLabel} tree executed with the selected merge strategy.`
     : plannerLabel === "Cost-Based"
       ? (changedCount
         ? `${plannerLabel} ${orderLabel.toLowerCase()} tree with ${changedCount} changed merge step${changedCount === 1 ? "" : "s"}.`
@@ -1703,13 +1692,13 @@ function renderStrategyNote() {
   const selectedStrategy = el.mergeStrategySelect.value || "top2_merge";
   const notes = {
     direct_fusion: {
-      text: "Directly combine variables from both side after sampling.",
+      text: "Directly combine variables from both sides after sampling.",
     },
     top2_merge: {
       text: "Use the top-2 candidate pairs from the two sides and keep the merged assignment with the lowest energy.",
     },
     conditioned_fusion: {
-      text: "Fixed the sampling decision for the left side, then conditioning the decision for the boundary variables for the right side.",
+      text: "Fix the sampling decision on the left side, then condition the boundary variables on the right side.",
     },
   };
   const note = notes[selectedStrategy] || { text: "" };
@@ -1717,7 +1706,7 @@ function renderStrategyNote() {
   let detail = "";
   if (fusion) {
     detail = fusion.supported
-      ? `${fusion.message} Assignment: ${fusion.assignment_size} variables.`
+      ? `${fusion.message}<br>Assignment: ${fusion.assignment_size} variables.`
       : fusion.message;
   }
   el.strategyNote.innerHTML = `
@@ -1731,7 +1720,9 @@ function renderMergeSteps() {
   const changedSteps = changedMergeSteps();
   el.mergeSteps.innerHTML = "";
   if (fusion?.supported && Array.isArray(fusion.execution_steps) && fusion.execution_steps.length) {
-    fusion.execution_steps.forEach((step, index) => {
+    fusion.execution_steps
+      .filter((step) => step.type !== "sampling")
+      .forEach((step, index) => {
       const card = document.createElement("div");
       card.className = `step-card${step.type === "result" ? " active" : ""}`;
       const extra = [];
@@ -1755,7 +1746,7 @@ function renderMergeSteps() {
     const plannerChanged = changedSteps.has(index);
     card.className = `step-card${index === steps.length - 1 ? " active" : ""}${plannerChanged ? " active" : ""}`;
     card.innerHTML = `
-      <h4>Step ${step.step}: merge [${step.cluster.map((value) => value + 1).join(", ")}]</h4>
+      <h4>Step ${step.step}: Merge [${step.cluster.map((value) => value + 1).join(", ")}]</h4>
       <div class="step-meta">Planned merge scope ${step.scope_size}</div>
       ${plannerChanged ? `<div class="step-meta">Planner changed this merge step.</div>` : ""}
     `;
@@ -1766,7 +1757,7 @@ function renderMergeSteps() {
 function friendlyExecutionStepType(type) {
   const labels = {
     sampling: "Actual sampling",
-    fusion: "Actual fusion",
+    fusion: "Actual merge",
     result: "Merged result",
   };
   return labels[type] || pretty(type);
@@ -2080,7 +2071,7 @@ function friendlyMergeStrategyName(value) {
 }
 function friendlyMergeOrderName(value) {
   const labels = {
-    left_deep: "Left-Deep",
+    left_deep: "Linear",
     bushy: "Bushy",
   };
   return labels[value] || pretty(value);

@@ -221,7 +221,7 @@ def execute_tree_fusion(
                 ]
                 merged_candidates = rank_assignments(cluster_bqm, merged_assignments, k)
             else:
-                raise ValueError(f"Unknown fusion strategy: {merge_strategy}")
+                raise ValueError(f"Unknown merge strategy: {merge_strategy}")
             fusion_ms = (time.perf_counter() - t0) * 1000.0
             total_fusion_ms += fusion_ms
 
@@ -229,7 +229,7 @@ def execute_tree_fusion(
             conflict_count, _ = count_active_conflicts(cluster_bqm, best_candidate["sample"])
             execution_steps.append(
                 {
-                    "label": f"Fuse [{', '.join(f'P{pid + 1}' for pid in left_cluster['partition_ids'])}] with [{', '.join(f'P{pid + 1}' for pid in right_cluster['partition_ids'])}]",
+                    "label": f"Merge [{', '.join(f'P{pid + 1}' for pid in left_cluster['partition_ids'])}] with [{', '.join(f'P{pid + 1}' for pid in right_cluster['partition_ids'])}]",
                     "type": "fusion",
                     "runtime_ms": round(sample_ms + fusion_ms, 2),
                     "fusion_ms": round(fusion_ms, 2),

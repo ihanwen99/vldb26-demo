@@ -41,6 +41,9 @@ class QuboBuilder:
         self.linear[var] = self.linear.get(var, 0.0) + value
 
     def add_quadratic(self, left: str, right: str, value: float) -> None:
+        if left == right:
+            self.add_linear(left, value)
+            return
         key = tuple(sorted((left, right)))
         self.quadratic[key] = self.quadratic.get(key, 0.0) + value
 
@@ -79,13 +82,28 @@ def build_mqo_qubo(instance: MQOInstance) -> Dict[str, object]:
         plans_by_query.setdefault(plan.query, []).append(plan)
         builder.add_linear(plan_var(plan.name), plan.cost)
 
+    query_by_plan: Dict[str, str] = {plan.name: plan.query for plan in instance.plans}
+
     for saving in instance.savings:
+        if saving.left_plan not in query_by_plan:
+            raise ValueError(f"savings references unknown plan: {saving.left_plan}")
+        if saving.right_plan not in query_by_plan:
+            raise ValueError(f"savings references unknown plan: {saving.right_plan}")
+        if query_by_plan[saving.left_plan] == query_by_plan[saving.right_plan]:
+            raise ValueError(
+                f"savings edge connects two plans of the same query "
+                f"({saving.left_plan}, {saving.right_plan}) in query {query_by_plan[saving.left_plan]}; "
+                f"these plans are mutually exclusive so the reward is spurious"
+            )
         builder.add_quadratic(plan_var(saving.left_plan), plan_var(saving.right_plan), -saving.value)
 
     default_weight = max((plan.cost for plan in instance.plans), default=1.0) + sum(
         saving.value for saving in instance.savings
     )
-    exactly_one_weight = instance.exactly_one_weight or (default_weight + 1.0)
+    minimum_safe_weight = default_weight + 1.0
+    exactly_one_weight = minimum_safe_weight if instance.exactly_one_weight is None else float(instance.exactly_one_weight)
+    if exactly_one_weight < minimum_safe_weight:
+        raise ValueError(f"exactly_one_weight is too small to dominate MQO costs/savings: got {exactly_one_weight}, require at least {minimum_safe_weight}")
 
     # Classical MQO QUBO:
     # sum plan costs - sum pairwise savings + lambda * sum_q (sum_{p in P_q} x_p - 1)^2

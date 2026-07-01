@@ -35,6 +35,9 @@ class QuboBuilder:
         self.linear[var] = self.linear.get(var, 0.0) + value
 
     def add_quadratic(self, left: str, right: str, value: float) -> None:
+        if left == right:
+            self.add_linear(left, value)
+            return
         key = tuple(sorted((left, right)))
         self.quadratic[key] = self.quadratic.get(key, 0.0) + value
 
@@ -65,8 +68,8 @@ def index_var(index_name: str) -> str:
     return f"index::{index_name}"
 
 
-def capacity_var(capacity: int) -> str:
-    return f"cap::{capacity}"
+def capacity_var(k: int) -> str:
+    return f"cap::k{k}"
 
 
 def binary_storage_fractions(storage_bound: int) -> List[int]:
@@ -87,7 +90,12 @@ def build_index_selection_qubo(instance: IndexSelectionInstance) -> Dict[str, ob
 
     max_utility = max((index.utility for index in instance.indices), default=1.0)
     max_storage = max((index.storage for index in instance.indices), default=1)
-    constraint_weight = instance.constraint_weight or (max_utility + max_storage * instance.storage_bound + 1.0)
+    default_constraint_weight = max_utility + max_storage * instance.storage_bound + 1.0
+    constraint_weight = default_constraint_weight if instance.constraint_weight is None else float(instance.constraint_weight)
+    if constraint_weight <= 0.0:
+        raise ValueError("constraint_weight must be positive")
+    if constraint_weight < default_constraint_weight:
+        raise ValueError(f"constraint_weight is too small: got {constraint_weight}, require at least {default_constraint_weight}")
 
     # EU term from the paper.
     for index in instance.indices:
@@ -108,7 +116,7 @@ def build_index_selection_qubo(instance: IndexSelectionInstance) -> Dict[str, ob
     # (sum_i s_i g_i - sum_k f_k c_k)^2
     storage_terms: List[Tuple[str, float]] = [
         (index_var(index.name), float(index.storage)) for index in instance.indices
-    ] + [(capacity_var(fraction), float(-fraction)) for fraction in fractions]
+    ] + [(capacity_var(k), float(-fraction)) for k, fraction in enumerate(fractions)]
     builder.add_square(storage_terms, target=0.0, weight=constraint_weight)
 
     variables: List[Dict[str, object]] = []
@@ -125,10 +133,10 @@ def build_index_selection_qubo(instance: IndexSelectionInstance) -> Dict[str, ob
                 "db_element": {"type": "index_candidate", "name": index.name, "table": index.table},
             }
         )
-    for fraction in fractions:
+    for k, fraction in enumerate(fractions):
         variables.append(
             {
-                "name": capacity_var(fraction),
+                "name": capacity_var(k),
                 "kind": "storage_fraction",
                 "fraction": fraction,
                 "db_element": {"type": "storage_fraction", "value": fraction},

@@ -43,6 +43,9 @@ class QuboBuilder:
         self.linear[var] = self.linear.get(var, 0.0) + value
 
     def add_quadratic(self, left: str, right: str, value: float) -> None:
+        if left == right:
+            self.add_linear(left, value)
+            return
         key = tuple(sorted((left, right)))
         self.quadratic[key] = self.quadratic.get(key, 0.0) + value
 
@@ -79,7 +82,7 @@ def paj_var(predicate: str, join_index: int) -> str:
 
 def build_join_order_qubo(instance: JoinOrderInstance) -> Dict[str, object]:
     num_relations = len(instance.relations)
-    num_joins = max(0, num_relations - 1)
+    num_joins = max(0, num_relations - 2)
     builder = QuboBuilder()
 
     relation_names = [relation.name for relation in instance.relations]
@@ -113,21 +116,22 @@ def build_join_order_qubo(instance: JoinOrderInstance) -> Dict[str, object]:
             builder.add_quadratic(predicate_var, left_var, -instance.predicate_weight)
             builder.add_quadratic(predicate_var, right_var, -instance.predicate_weight)
 
-    # Visualization-friendly cost approximation:
-    # sum of logarithmic intermediate cardinalities across join prefixes.
-    # This keeps the same roj/paj variable families from the paper while
-    # avoiding the hardware-specific threshold discretisation in the first version.
+    # VLDB24 v2 H_cost (squared form):
+    # sum_j (sum_t log10(card_t) * roj[t,j] + sum_p log10(sel_p) * paj[p,j])^2.
+    # Using a squared term (instead of a linear sum) makes each join prefix cost
+    # a genuine tradeoff: a predicate is neither a pure reward (linear negative
+    # log_selectivity would always lower cost) nor pure poison (abs would always
+    # raise it), because the contribution is quadratic and coupled to the other
+    # active terms in the same prefix.
     for join_index in range(num_joins):
-        for relation_name in relation_names:
-            builder.add_linear(
-                roj_var(relation_name, join_index),
-                instance.cost_weight * relation_by_name[relation_name].log_cardinality,
-            )
-        for predicate in instance.predicates:
-            builder.add_linear(
-                paj_var(predicate.name, join_index),
-                instance.cost_weight * predicate.log_selectivity,
-            )
+        cost_terms: List[Tuple[str, float]] = [
+            (roj_var(relation_name, join_index), relation_by_name[relation_name].log_cardinality)
+            for relation_name in relation_names
+        ] + [
+            (paj_var(predicate.name, join_index), predicate.log_selectivity)
+            for predicate in instance.predicates
+        ]
+        builder.add_square(cost_terms, target=0.0, weight=instance.cost_weight)
 
     variables: List[Dict[str, object]] = []
     for join_index in range(num_joins):
@@ -191,8 +195,8 @@ def build_join_order_qubo(instance: JoinOrderInstance) -> Dict[str, object]:
             {
                 "name": "Cost",
                 "title": "Cost Approximation",
-                "formula": "sum log_cardinality + sum log_selectivity",
-                "meaning": "Approximate the join cost.",
+                "formula": "sum_j (sum_r log_cardinality * roj[r,j] + sum_p log_selectivity * paj[p,j])^2",
+                "meaning": "Approximate the join cost as a squared (quadratic) term so predicate selection is a genuine tradeoff.",
                 "variables": ["roj", "paj"],
             },
         ],

@@ -5,7 +5,6 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Tuple
 
-from merge_strategy.fusion_runtime import execute_tree_fusion
 from qubo_construction.index_selection_qubo import build_demo_model as build_index_selection_demo
 from qubo_construction.join_order_qubo import build_demo_model as build_join_order_demo
 from qubo_construction.mqo_qubo import build_demo_model as build_mqo_demo
@@ -83,6 +82,8 @@ def build_real_fusion_payload(
     merge_order: str,
     planner_mode: str = "default",
 ) -> Dict[str, object]:
+    if problem not in PROBLEM_BUILDERS:
+        raise KeyError(f"Unknown problem: {problem}")
     cache_key = f"{REAL_FUSION_CACHE_VERSION}_{problem}_s{scale}_p{partitions}_{merge_strategy}_{merge_order}_{planner_mode}.json"
     cache_path = CACHE_DIR / cache_key
     if cache_path.exists():
@@ -92,6 +93,7 @@ def build_real_fusion_payload(
     graph = qubo_to_graph(base)
     partitioning = decompose_problem(problem, base, graph, max(2, partitions))
     merge_plan = build_merge_plan(graph, partitioning, merge_strategy, merge_order, planner_mode)
+    from merge_strategy.fusion_runtime import execute_tree_fusion
     result = execute_tree_fusion(
         qubo=base["qubo"],
         partitions=partitioning["partitions"],
@@ -115,7 +117,7 @@ def build_real_fusion_payload(
         "total_runtime_ms": result["total_runtime_ms"],
         "assignment_size": result["assignment_size"],
         "execution_steps": result["execution_steps"],
-        "message": "Tree-guided D-Wave execution completed.",
+        "message": "Tree-guided execution completed.",
     }
     CACHE_DIR.mkdir(exist_ok=True)
     cache_path.write_text(json.dumps(payload))
@@ -704,6 +706,9 @@ def build_merge_plan(
     boundary_edges = partitioning["boundary_edges"]
     starting_assignments = partitioning["assignments_before_merge"]
 
+    if merge_order not in ("left_deep", "bushy"):
+        raise ValueError(f"Unknown merge order: {merge_order}")
+
     if planner_mode == "cost_based":
         if merge_order == "bushy":
             merge_sequence = merge_tree_bushy_cost_based(partitions, boundary_edges)
@@ -714,6 +719,9 @@ def build_merge_plan(
             merge_sequence = merge_tree_bushy(partitions)
         else:
             merge_sequence = merge_tree_left_deep(partitions)
+
+    if merge_strategy not in ("direct_fusion", "top2_merge", "conditioned_fusion"):
+        raise ValueError(f"Unknown merge strategy: {merge_strategy}")
 
     current_assignments = dict(starting_assignments)
     steps = []

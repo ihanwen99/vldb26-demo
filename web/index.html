@@ -12,7 +12,7 @@
         <div>
           <h1>QFusion</h1>
           <p class="summary">
-            A Demonstration for QUBO Construction, Decomposition, Fusion Planning and Execution <br>
+            A Demonstration of Boundary-Aware Fusion Planning and Execution for Large-Scale QUBO Optimization <br>
             Solving Database Optimization Problems: Join Order, Multiple Query Optimization, and Index Selection
           </p>
         </div>
@@ -89,7 +89,7 @@
               <p class="scenario-tag">Scenario 2</p>
               <h2>Decomposition and Boundary</h2>
             </div>
-            <p class="scenario-summary">Inspect QUBO is split into multiple partitions and corresponding cut boundaries.</p>
+            <p class="scenario-summary">Inspect how the QUBO is split into multiple partitions and the corresponding cut boundaries.</p>
           </div>
           <div class="scenario-grid boundary-top-grid">
             <section class="panel">
@@ -131,34 +131,34 @@
               <p class="scenario-tag">Scenario 3</p>
               <h2>Fusion Planning and Execution</h2>
             </div>
-            <p class="scenario-summary">Select Fusion Strategy, Merge Order and Trigger Planning.</p>
+            <p class="scenario-summary">Select a Merge Strategy and Fusion Tree Structure, then trigger Planning.</p>
           </div>
           <div class="scenario-grid merge-top-grid">
             <section class="panel">
               <div class="panel-title">
                 <h3>Fusion Tree</h3>
-                <p>Planned fusion order over the current partitions.</p>
+                <p>Fusion tree structure over the current partitions.</p>
               </div>
               <svg id="mergeTree" class="chart merge-tree" viewBox="0 0 520 280"></svg>
               <div id="mergeTreeNote" class="step-meta"></div>
               <div class="panel-title merge-subtitle">
                 <h3>Fusion Steps</h3>
-                <p>Per-step scope, energy, conflicts, and runtime.</p>
+                <p>Per-step runtime; final energy and conflicts.</p>
               </div>
               <div id="mergeSteps" class="step-list"></div>
             </section>
             <section class="panel">
               <div class="panel-title">
                 <h3>Fusion Controls</h3>
-                <p>Select one fusion strategy from the original pipeline, then trigger actual execution.</p>
+                <p>Choose a merge strategy, then trigger actual execution.</p>
               </div>
               <div class="inline-controls merge-controls">
                 <label>
-                  <span>Fusion Strategy</span>
+                  <span>Merge Strategy</span>
                   <select id="mergeStrategySelect"></select>
                 </label>
                 <label>
-                  <span>Merge Order</span>
+                  <span>Fusion Tree Structure</span>
                   <select id="mergeOrderSelect"></select>
                 </label>
               </div>

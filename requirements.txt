@@ -1,0 +1,17 @@
+# QFusion demo runtime dependencies.
+# Derived from the actual imports in the source (not from a local conda env):
+#   merge_strategy/fusion_runtime.py:  import dimod
+#                                      from dwave.system import DWaveSampler, EmbeddingComposite
+# Everything else used by the demo (json, os, http.server, urllib, pathlib,
+# dataclasses, typing, time) is part of the Python standard library.
+#
+# Tested working with Python 3.9 and the versions pinned as lower bounds below
+# (dimod 0.12.20, dwave-system 1.33.0). Lower bounds keep the install flexible;
+# newer Ocean releases are expected to work.
+#
+# dwave-system pulls in the D-Wave Ocean components needed for DWaveSampler /
+# EmbeddingComposite. Running Scenario 3 also requires D-Wave Leap credentials
+# (configure via `dwave config create` or the DWAVE_API_TOKEN env var).
+
+dimod>=0.12
+dwave-system>=1.33
