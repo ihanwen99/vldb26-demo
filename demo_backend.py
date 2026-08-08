@@ -12,7 +12,7 @@ from qubo_construction.mqo_qubo import build_demo_model as build_mqo_demo
 
 ProblemPayload = Dict[str, object]
 CACHE_DIR = Path(__file__).resolve().parent / ".cache"
-CACHE_VERSION = "v9"
+CACHE_VERSION = "v11"
 REAL_FUSION_CACHE_VERSION = "rf7"
 
 
@@ -584,25 +584,32 @@ def optimize_assignments(
     return assignments
 
 
-def merge_tree_left_deep(partitions: List[Dict[str, object]]) -> List[Tuple[int, ...]]:
+def merge_tree_left_deep(
+    partitions: List[Dict[str, object]],
+) -> List[Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]]:
     order = []
     current = (partitions[0]["id"],)
     for partition in partitions[1:]:
-        nxt = current + (partition["id"],)
-        order.append(nxt)
+        child_b = (partition["id"],)
+        nxt = current + child_b
+        order.append((current, child_b, nxt))
         current = nxt
     return order
 
 
-def merge_tree_bushy(partitions: List[Dict[str, object]]) -> List[Tuple[int, ...]]:
+def merge_tree_bushy(
+    partitions: List[Dict[str, object]],
+) -> List[Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]]:
     frontier = [(partition["id"],) for partition in partitions]
     plan = []
     while len(frontier) > 1:
         merged = []
         for idx in range(0, len(frontier), 2):
             if idx + 1 < len(frontier):
-                combo = tuple(sorted(frontier[idx] + frontier[idx + 1]))
-                plan.append(combo)
+                child_a = frontier[idx]
+                child_b = frontier[idx + 1]
+                combo = tuple(sorted(child_a + child_b))
+                plan.append((child_a, child_b, combo))
                 merged.append(combo)
             else:
                 merged.append(frontier[idx])
@@ -626,72 +633,81 @@ def boundary_strength_between(
     return total
 
 
-def merge_tree_left_deep_cost_based(
+def tree_cost(
+    plan: List[Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]],
+    boundary_edges: List[Dict[str, object]],
+) -> float:
+    # Paper cost model: C(T) = sum over merges of |L union R| * cut(L, R).
+    total = 0.0
+    for child_a, child_b, merged in plan:
+        total += len(merged) * boundary_strength_between(child_a, child_b, boundary_edges)
+    return total
+
+
+def merge_tree_dp(
     partitions: List[Dict[str, object]],
     boundary_edges: List[Dict[str, object]],
-) -> List[Tuple[int, ...]]:
-    leaves = [(partition["id"],) for partition in partitions]
-    if len(leaves) <= 1:
-        return []
-    if len(leaves) == 2:
-        return [tuple(sorted(leaves[0] + leaves[1]))]
+) -> List[Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]]:
+    ids = [partition["id"] for partition in partitions]
+    n = len(ids)
+    if n > 14:
+        raise ValueError(f"DP fusion planner supports at most 14 blocks, got {n}")
+    index_of = {block_id: index for index, block_id in enumerate(ids)}
 
-    best_pair = None
-    best_score = None
-    for left_index, left in enumerate(leaves):
-        for right in leaves[left_index + 1 :]:
-            score = boundary_strength_between(left, right, boundary_edges)
-            tie_break = -(len(left) + len(right))
-            candidate = (score, tie_break, tuple(sorted(left + right)), left, right)
-            if best_score is None or candidate > best_score:
-                best_score = candidate
-                best_pair = (left, right)
+    pair_cut = [[0.0] * n for _ in range(n)]
+    for edge in boundary_edges:
+        left = index_of[edge["left_partition"]]
+        right = index_of[edge["right_partition"]]
+        pair_cut[left][right] += float(edge["abs_value"])
+        pair_cut[right][left] += float(edge["abs_value"])
 
-    assert best_pair is not None
-    current = tuple(sorted(best_pair[0] + best_pair[1]))
-    plan = [current]
-    remaining = [leaf for leaf in leaves if leaf not in best_pair]
+    # inside[mask] = edge weight with both endpoints in mask, so that
+    # cut(L, S \ L) = inside[S] - inside[L] - inside[S \ L].
+    inside = [0.0] * (1 << n)
+    for mask in range(1, 1 << n):
+        rest = mask & (mask - 1)
+        low = (mask & -mask).bit_length() - 1
+        added = 0.0
+        walk = rest
+        while walk:
+            added += pair_cut[low][(walk & -walk).bit_length() - 1]
+            walk &= walk - 1
+        inside[mask] = inside[rest] + added
 
-    while remaining:
-        best_next = None
-        best_score = None
-        for candidate in remaining:
-            score = boundary_strength_between(current, candidate, boundary_edges)
-            tie_break = -len(candidate)
-            rank = (score, tie_break, tuple(sorted(current + candidate)))
-            if best_score is None or rank > best_score:
-                best_score = rank
-                best_next = candidate
-        assert best_next is not None
-        current = tuple(sorted(current + best_next))
-        plan.append(current)
-        remaining = [candidate for candidate in remaining if candidate != best_next]
-    return plan
+    # cost[S] = min over proper nonempty L subset S of
+    #           cost[L] + cost[S \ L] + |S| * cut(L, S \ L).
+    cost = [0.0] * (1 << n)
+    split = [0] * (1 << n)
+    for mask in range(1, 1 << n):
+        if mask & (mask - 1) == 0:
+            continue
+        size = bin(mask).count("1")
+        low_bit = mask & -mask
+        best = float("inf")
+        sub = (mask - 1) & mask
+        while sub:
+            # Requiring the lowest set bit in L visits each unordered split once.
+            if sub & low_bit:
+                other = mask ^ sub
+                candidate = cost[sub] + cost[other] + size * (inside[mask] - inside[sub] - inside[other])
+                if candidate < best:
+                    best = candidate
+                    split[mask] = sub
+            sub = (sub - 1) & mask
+        cost[mask] = best
 
+    plan: List[Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]] = []
 
-def merge_tree_bushy_cost_based(
-    partitions: List[Dict[str, object]],
-    boundary_edges: List[Dict[str, object]],
-) -> List[Tuple[int, ...]]:
-    frontier = [(partition["id"],) for partition in partitions]
-    plan: List[Tuple[int, ...]] = []
-    while len(frontier) > 1:
-        best_pair = None
-        best_score = None
-        for left_index, left in enumerate(frontier):
-            for right in frontier[left_index + 1 :]:
-                score = boundary_strength_between(left, right, boundary_edges)
-                tie_break = -(len(left) + len(right))
-                merged = tuple(sorted(left + right))
-                rank = (score, tie_break, merged)
-                if best_score is None or rank > best_score:
-                    best_score = rank
-                    best_pair = (left, right, merged)
-        assert best_pair is not None
-        left, right, merged = best_pair
-        plan.append(merged)
-        frontier = [cluster for cluster in frontier if cluster not in (left, right)] + [merged]
-        frontier = sorted(frontier, key=lambda cluster: (len(cluster), cluster))
+    def emit(mask: int) -> Tuple[int, ...]:
+        if mask & (mask - 1) == 0:
+            return (ids[(mask & -mask).bit_length() - 1],)
+        left = emit(split[mask])
+        right = emit(mask ^ split[mask])
+        merged = tuple(sorted(left + right))
+        plan.append((left, right, merged))
+        return merged
+
+    emit((1 << n) - 1)
     return plan
 
 
@@ -710,10 +726,8 @@ def build_merge_plan(
         raise ValueError(f"Unknown merge order: {merge_order}")
 
     if planner_mode == "cost_based":
-        if merge_order == "bushy":
-            merge_sequence = merge_tree_bushy_cost_based(partitions, boundary_edges)
-        else:
-            merge_sequence = merge_tree_left_deep_cost_based(partitions, boundary_edges)
+        # The DP searches every tree shape, so merge_order does not constrain the result.
+        merge_sequence = merge_tree_dp(partitions, boundary_edges)
     else:
         if merge_order == "bushy":
             merge_sequence = merge_tree_bushy(partitions)
@@ -726,7 +740,9 @@ def build_merge_plan(
     current_assignments = dict(starting_assignments)
     steps = []
     merged_so_far: set[int] = set()
-    for step_index, cluster in enumerate(merge_sequence, start=1):
+    fixed_partition_ids: set[int] = set()
+    node_linear = {node["id"]: node["linear"] for node in graph["nodes"]}
+    for step_index, (child_a, child_b, cluster) in enumerate(merge_sequence, start=1):
         merged_so_far.update(cluster)
         scope = [
             node
@@ -742,8 +758,25 @@ def build_merge_plan(
             ordered = list(dict.fromkeys(important + scope))
             current_assignments = optimize_assignments(graph, current_assignments, ordered, iterations=5)
         elif merge_strategy == "conditioned_fusion":
-            focus_vars = sorted(scope, key=lambda name: abs(next(n["linear"] for n in graph["nodes"] if n["id"] == name)))
-            current_assignments = optimize_assignments(graph, current_assignments, focus_vars, iterations=3)
+            # Conditioned Fusion: fix already-solved upstream partitions, solve only the
+            # incoming variables against the conditioned sub-objective. Holding the fixed
+            # variables constant while flipping incoming ones makes assignment_delta absorb
+            # each fixed neighbor's coupling quadratic(u, v) * value(u) into the incoming
+            # variable v's linear coefficient, mirroring fusion_runtime.conditioned_subbqm.
+            incoming_partition_ids = set(cluster) - fixed_partition_ids
+            incoming_vars = [
+                node
+                for partition in partitions
+                if partition["id"] in incoming_partition_ids
+                for node in partition["nodes"]
+            ]
+            # Deterministic sign-of-linear initialization for the incoming variables, then a
+            # deterministic single-bit-flip descent restricted to them (upstream stays fixed).
+            for name in incoming_vars:
+                current_assignments[name] = 1 if node_linear[name] < 0 else 0
+            focus_vars = sorted(incoming_vars, key=lambda name: (abs(node_linear[name]), name))
+            current_assignments = optimize_assignments(graph, current_assignments, focus_vars, iterations=5)
+            fixed_partition_ids.update(cluster)
 
         visible_boundary = [
             edge
@@ -757,6 +790,7 @@ def build_merge_plan(
                 "step": step_index,
                 "cluster": list(cluster),
                 "scope_size": len(scope),
+                "boundary_cut": round(boundary_strength_between(child_a, child_b, boundary_edges), 3),
                 "energy": energy,
                 "conflicts": len(conflicts),
                 "runtime_ms": 20 + len(scope) * 3 + step_index * 11,
@@ -769,6 +803,7 @@ def build_merge_plan(
         "strategy": merge_strategy,
         "order": merge_order,
         "planner_mode": planner_mode,
+        "tree_cost": round(tree_cost(merge_sequence, boundary_edges), 3),
         "steps": steps,
         "final_assignments": current_assignments,
         "final_energy": total_energy(graph, current_assignments),
@@ -981,6 +1016,7 @@ def summarize_metrics(
     after = merge_plan["final_assignments"]
     boundary_conflicts_before = active_conflicts(graph, before, partitioning["boundary_edges"])
     runtimes = [step["runtime_ms"] for step in merge_plan["steps"]]
+    steps = merge_plan["steps"]
     return {
         "partition_count": len(partitioning["partitions"]),
         "boundary_size": partitioning["boundary_edge_count"],
@@ -994,4 +1030,6 @@ def summarize_metrics(
         "runtime_series": runtimes,
         "energy_series": [step["energy"] for step in merge_plan["steps"]],
         "conflict_series": [step["conflicts"] for step in merge_plan["steps"]],
+        "max_step_cut": max((s["boundary_cut"] for s in steps), default=0),
+        "cut_series": [s["boundary_cut"] for s in steps],
     }

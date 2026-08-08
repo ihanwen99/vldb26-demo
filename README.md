@@ -1,12 +1,6 @@
 # QFusion: A Demonstration of Boundary-Aware Fusion Planning and Execution for Large-Scale QUBO Optimization
 
-QFusion is an interactive demo that shows how large-scale QUBO optimization problems are constructed, decomposed along their boundaries, and solved by boundary-aware fusion planning and execution. It covers three database optimization problems: Join Order, Multiple Query Optimization, and Index Selection.
-
-## Problems
-
-- Join Order
-- Multiple Query Optimization (MQO)
-- Index Selection
+QFusion is an interactive demonstration (PVLDB Vol. 19, No. 12, VLDB 2026) that shows how large-scale QUBO optimization problems are constructed, decomposed along their boundaries, and solved by boundary-aware fusion planning and execution on a real quantum annealer. It covers three database optimization problems: Join Order, Multiple Query Optimization, and Index Selection.
 
 ## Requirements / Install
 
@@ -16,11 +10,9 @@ Python 3.9+.
 pip install -r requirements.txt
 ```
 
-`dimod` and `dwave-system` are only needed for Scenario 3; Scenarios 1 and 2 run on the Python standard library alone.
+`dimod` and `dwave-system` are only needed for Scenario 3 execution; Scenarios 1 and 2 run on the Python standard library alone.
 
 ## Run
-
-Start the demo server:
 
 ```bash
 python demo_app.py
@@ -32,8 +24,6 @@ The host and port default to `127.0.0.1` and `8000`. Set `VLDB_DEMO_HOST` and `V
 
 ## Scenarios
 
-The UI walks through three scenarios.
-
 ### Scenario 1: QUBO Construction
 
 Build a problem-specific QUBO and inspect it as a graph or matrix alongside its database semantics.
@@ -44,32 +34,40 @@ Split the QUBO into partitions and inspect the resulting subproblems and cut bou
 
 ### Scenario 3: Fusion Planning and Execution
 
-Choose the fusion configuration, then run the actual execution. Two controls are available:
+Configure the fusion, plan it, then run the actual execution:
 
 - Merge Strategy: Direct Fusion, Top-2 Merge, Conditioned Fusion
-- Fusion Tree Structure: Linear, Bushy
+- Fusion Tree Structure: Linear, Bushy (the default tree before planning)
+- Plan: rewrites the default tree with the cost-based fusion planner. The planner scores a tree by summing, over its merges, the boundary coupling between the two merged sides weighted by the number of blocks the merge produces, and finds the lowest-cost tree exactly with a subset dynamic program over the blocks. The resulting tree cost is reported next to the plan.
 
 ## D-Wave Setup
 
-Scenario 3 executes on a real D-Wave quantum annealer and needs D-Wave Leap credentials. Use a D-Wave Leap account, then either run `dwave config create` or set the `DWAVE_API_TOKEN` environment variable.
-
-Without D-Wave credentials, Scenario 3 (the actual fusion execution) cannot run. Scenarios 1 and 2 (construction, and decomposition and boundary inspection) work without D-Wave, since they do not touch the actual quantum execution.
+Scenario 3 executes on a real D-Wave quantum annealer and needs D-Wave Leap credentials: run `dwave config create` or set the `DWAVE_API_TOKEN` environment variable. Scenarios 1 and 2 work without D-Wave.
 
 ## Project Structure
 
 ```text
-demo_app.py
-demo_backend.py
-merge_strategy/
-qubo_construction/
-web/
+demo_app.py         Main entrance (HTTP server)
+demo_backend.py     Payload generation, decomposition, boundary summaries, fusion planning (cost model + subset DP)
+merge_strategy/     Quantum-backed fusion runtime
+qubo_construction/  Database problem-specific QUBO builders
+web/                Frontend UI
 ```
 
-- `demo_app.py`: Main entrance (HTTP server)
-- `demo_backend.py`: Payload generation, decomposition, boundary summaries, merge planning
-- `merge_strategy/`: Quantum-backed fusion runtime
-- `qubo_construction/`: Database problem-specific QUBO builders
-- `web/`: Frontend UI
+## Citation
+
+```bibtex
+@article{qfusion26,
+  author  = {Hanwen Liu and Ibrahim Sabek},
+  title   = {{QFusion}: A Demonstration of Boundary-Aware Fusion Planning and Execution for Large-Scale {QUBO} Optimization},
+  journal = {Proc. VLDB Endow.},
+  volume  = {19},
+  number  = {12},
+  pages   = {4826--4829},
+  year    = {2026},
+  doi     = {10.14778/3827998.3828132}
+}
+```
 
 ## License
 

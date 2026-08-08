@@ -1443,11 +1443,13 @@ function renderMergeTree() {
   const plannerLabel = friendlyPlannerModeName(state.payload.merge_plan?.planner_mode || selectedPlannerMode());
   const changedCount = changedSteps.size;
   const summary = state.fusionResult?.supported
-    ? `${plannerLabel} ${orderLabel} tree executed with the selected merge strategy.`
+    ? (plannerLabel === "Cost-Based"
+      ? `${plannerLabel} tree executed with the selected merge strategy.`
+      : `${plannerLabel} ${orderLabel} tree executed with the selected merge strategy.`)
     : plannerLabel === "Cost-Based"
       ? (changedCount
-        ? `${plannerLabel} ${orderLabel.toLowerCase()} tree with ${changedCount} changed merge step${changedCount === 1 ? "" : "s"}.`
-        : `${plannerLabel} ${orderLabel.toLowerCase()} tree kept the same merge structure.`)
+        ? `${plannerLabel} tree with ${changedCount} changed merge step${changedCount === 1 ? "" : "s"}.`
+        : `${plannerLabel} tree kept the same merge structure.`)
       : `${plannerLabel} ${orderLabel.toLowerCase()} tree with ${steps.length} merge steps.`;
   const note = document.getElementById("mergeTreeNote");
   if (note) note.textContent = summary;
@@ -1673,18 +1675,16 @@ function renderMetrics() {
   const fusion = state.fusionResult;
   const cards = [
     ["Partitions", metrics.partition_count],
-    ["Boundary Size", metrics.boundary_size],
-    ["Boundary Weight", formatCompact(metrics.boundary_weight_sum)],
-    ["Final Energy", fusion?.supported ? formatCompact(fusion.energy) : "--"],
-    ["Conflicts", fusion?.supported ? fusion.conflict_count : "--"],
-    ["Conflict Weight", fusion?.supported ? formatCompact(fusion.conflict_weight) : "--"],
     ["Merge Depth", metrics.merge_depth],
+    ["Total Boundary Coupling", formatCompact(metrics.boundary_weight_sum)],
+    ["Tree Cost", state.payload.merge_plan?.tree_cost !== undefined ? formatCompact(state.payload.merge_plan.tree_cost) : "--"],
     ["Sample Time (ms)", fusion?.supported ? formatCompact(fusion.sample_ms) : "--"],
     ["Fusion Time (ms)", fusion?.supported ? formatCompact(fusion.fusion_ms) : "--"],
-    ["Runtime (ms)", fusion?.supported ? formatCompact(fusion.total_runtime_ms) : "--"],
+    ["Runtime (ms)", fusion?.supported ? formatCompact(fusion.total_runtime_ms) : "--", "highlight wide"],
+    ["Final Energy", fusion?.supported ? formatCompact(fusion.energy) : "--", "highlight wide"],
   ];
-  el.metricsGrid.innerHTML = cards.map(([label, value]) => `
-    <div class="metric-card"><span>${label}</span><strong>${value}</strong></div>
+  el.metricsGrid.innerHTML = cards.map(([label, value, tags = ""]) => `
+    <div class="metric-card${tags.includes("wide") ? " metric-card-wide" : ""}${tags.includes("highlight") ? " metric-card-highlight" : ""}"><span>${label}</span><strong>${value}</strong></div>
   `).join("");
 }
 
@@ -1748,6 +1748,7 @@ function renderMergeSteps() {
     card.innerHTML = `
       <h4>Step ${step.step}: Merge [${step.cluster.map((value) => value + 1).join(", ")}]</h4>
       <div class="step-meta">Planned merge scope ${step.scope_size}</div>
+      <div class="step-meta" title="Largest boundary weight reconciled in a single merge step; grows for bushy trees and bounds the hardest sub-problem a solver must handle at once.">Boundary cut ${formatCompact(step.boundary_cut)}</div>
       ${plannerChanged ? `<div class="step-meta">Planner changed this merge step.</div>` : ""}
     `;
     el.mergeSteps.appendChild(card);

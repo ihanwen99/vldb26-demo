@@ -28,6 +28,11 @@ class Predicate:
 class JoinOrderInstance:
     relations: List[Relation]
     predicates: List[Predicate]
+    # validity_weight is the PER-JOIN base weight for the HVa/HVb validity
+    # penalties. build_join_order_qubo scales it by num_joins to get the
+    # effective penalty, matching the VLDB24 v2 penalty scaling so that the
+    # exactly-one (prefix-size) constraint dominates the cost term and the true
+    # ground state stays feasible as the number of relations grows.
     validity_weight: float = 20.0
     predicate_weight: float = 8.0
     cost_weight: float = 1.0
@@ -83,6 +88,12 @@ def paj_var(predicate: str, join_index: int) -> str:
 def build_join_order_qubo(instance: JoinOrderInstance) -> Dict[str, object]:
     num_relations = len(instance.relations)
     num_joins = max(0, num_relations - 2)
+    # VLDB24 v2 penalty scaling: treat instance.validity_weight as the per-join
+    # base weight and scale it by num_joins so the total validity penalty grows
+    # with the problem size. Without this, at num_relations >= 6 the cost term
+    # can outweigh a constant validity penalty and the global optimum becomes
+    # infeasible (ground state violates the HVa exactly-one constraint).
+    effective_validity_weight = instance.validity_weight * num_joins
     builder = QuboBuilder()
 
     relation_names = [relation.name for relation in instance.relations]
@@ -94,7 +105,7 @@ def build_join_order_qubo(instance: JoinOrderInstance) -> Dict[str, object]:
         builder.add_square(
             ((roj_var(relation_name, join_index), 1.0) for relation_name in relation_names),
             target=join_index + 2,
-            weight=instance.validity_weight,
+            weight=effective_validity_weight,
         )
 
     # Paper-aligned validity term HVb:
@@ -103,8 +114,8 @@ def build_join_order_qubo(instance: JoinOrderInstance) -> Dict[str, object]:
         for join_index in range(1, num_joins):
             previous_var = roj_var(relation_name, join_index - 1)
             current_var = roj_var(relation_name, join_index)
-            builder.add_linear(previous_var, instance.validity_weight)
-            builder.add_quadratic(previous_var, current_var, -instance.validity_weight)
+            builder.add_linear(previous_var, effective_validity_weight)
+            builder.add_quadratic(previous_var, current_var, -effective_validity_weight)
 
     # Paper-aligned predicate applicability term Hp.
     for predicate in instance.predicates:
