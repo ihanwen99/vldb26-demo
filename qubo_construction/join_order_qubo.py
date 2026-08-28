@@ -28,13 +28,10 @@ class Predicate:
 class JoinOrderInstance:
     relations: List[Relation]
     predicates: List[Predicate]
-    # validity_weight is the PER-JOIN base weight for the HVa/HVb validity
-    # penalties. build_join_order_qubo scales it by num_joins to get the
-    # effective penalty, matching the VLDB24 v2 penalty scaling so that the
-    # exactly-one (prefix-size) constraint dominates the cost term and the true
-    # ground state stays feasible as the number of relations grows.
+    # Per-join validity penalty. The builder scales it with the number of joins
+    # and uses the same effective weight for HVa, HVb, and Hp by default.
     validity_weight: float = 20.0
-    predicate_weight: float = 8.0
+    predicate_weight: float | None = None
     cost_weight: float = 1.0
 
 
@@ -88,12 +85,16 @@ def paj_var(predicate: str, join_index: int) -> str:
 def build_join_order_qubo(instance: JoinOrderInstance) -> Dict[str, object]:
     num_relations = len(instance.relations)
     num_joins = max(0, num_relations - 2)
-    # VLDB24 v2 penalty scaling: treat instance.validity_weight as the per-join
-    # base weight and scale it by num_joins so the total validity penalty grows
-    # with the problem size. Without this, at num_relations >= 6 the cost term
-    # can outweigh a constant validity penalty and the global optimum becomes
-    # infeasible (ground state violates the HVa exactly-one constraint).
+    if instance.validity_weight <= 0.0:
+        raise ValueError("validity_weight must be positive")
+    if instance.cost_weight < 0.0:
+        raise ValueError("cost_weight must be non-negative")
+
+    # Scale the common validity penalty with the number of represented joins.
     effective_validity_weight = instance.validity_weight * num_joins
+    effective_predicate_weight = effective_validity_weight if instance.predicate_weight is None else float(instance.predicate_weight)
+    if effective_predicate_weight <= 0.0:
+        raise ValueError("predicate_weight must be positive")
     builder = QuboBuilder()
 
     relation_names = [relation.name for relation in instance.relations]
@@ -123,17 +124,13 @@ def build_join_order_qubo(instance: JoinOrderInstance) -> Dict[str, object]:
             predicate_var = paj_var(predicate.name, join_index)
             left_var = roj_var(predicate.left_relation, join_index)
             right_var = roj_var(predicate.right_relation, join_index)
-            builder.add_linear(predicate_var, 2.0 * instance.predicate_weight)
-            builder.add_quadratic(predicate_var, left_var, -instance.predicate_weight)
-            builder.add_quadratic(predicate_var, right_var, -instance.predicate_weight)
+            builder.add_linear(predicate_var, 2.0 * effective_predicate_weight)
+            builder.add_quadratic(predicate_var, left_var, -effective_predicate_weight)
+            builder.add_quadratic(predicate_var, right_var, -effective_predicate_weight)
 
-    # VLDB24 v2 H_cost (squared form):
+    # Squared logarithmic cost approximation:
     # sum_j (sum_t log10(card_t) * roj[t,j] + sum_p log10(sel_p) * paj[p,j])^2.
-    # Using a squared term (instead of a linear sum) makes each join prefix cost
-    # a genuine tradeoff: a predicate is neither a pure reward (linear negative
-    # log_selectivity would always lower cost) nor pure poison (abs would always
-    # raise it), because the contribution is quadratic and coupled to the other
-    # active terms in the same prefix.
+    # The square couples cardinality and selectivity terms within each prefix.
     for join_index in range(num_joins):
         cost_terms: List[Tuple[str, float]] = [
             (roj_var(relation_name, join_index), relation_by_name[relation_name].log_cardinality)
@@ -253,7 +250,7 @@ def build_demo_model(scale: int = 4) -> Dict[str, object]:
             f"p_{relation_names[idx].lower()}{relation_names[idx + 1].lower()}",
             relation_names[idx],
             relation_names[idx + 1],
-            -1.2 + idx * 0.25,
+            -max(0.05, 1.2 - idx * 0.15),
         )
         for idx in range(num_relations - 1)
     ]

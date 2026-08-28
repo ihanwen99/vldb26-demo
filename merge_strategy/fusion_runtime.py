@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError, version
 import time
 from typing import Any, Dict, Iterable, List, Tuple
 
@@ -9,6 +10,37 @@ from dwave.system import DWaveSampler, EmbeddingComposite
 
 Assignment = Dict[Any, int]
 Candidate = Dict[str, Any]
+
+
+def installed_ocean_versions() -> Dict[str, str]:
+    versions: Dict[str, str] = {}
+    for distribution in ("dimod", "dwave-system", "dwave-cloud-client", "minorminer"):
+        try:
+            versions[distribution] = version(distribution)
+        except PackageNotFoundError:
+            versions[distribution] = "not-installed"
+    return versions
+
+
+def sampler_solver_id(raw_sampler: Any) -> str:
+    solver = getattr(raw_sampler, "solver", None)
+    solver_id = getattr(solver, "id", None)
+    if solver_id:
+        return str(solver_id)
+
+    properties = getattr(raw_sampler, "properties", {})
+    if isinstance(properties, dict):
+        chip_id = properties.get("chip_id")
+        if chip_id:
+            return str(chip_id)
+    return "unknown"
+
+
+def validate_sampling_parameters(k: int, num_reads: int) -> None:
+    if k < 1:
+        raise ValueError(f"k must be at least 1, got {k}")
+    if num_reads < 1:
+        raise ValueError(f"num_reads must be at least 1, got {num_reads}")
 
 
 def bqm_from_qubo_payload(qubo: Dict[str, object]) -> dimod.BinaryQuadraticModel:
@@ -63,9 +95,9 @@ def sample_top_k(
     k: int,
     num_reads: int,
 ) -> Tuple[List[Candidate], float]:
+    validate_sampling_parameters(k, num_reads)
     t0 = time.perf_counter()
     sampleset = sampler.sample(bqm, num_reads=num_reads)
-    runtime_ms = (time.perf_counter() - t0) * 1000.0
 
     candidates: List[Candidate] = []
     seen = set()
@@ -78,6 +110,7 @@ def sample_top_k(
         candidates.append({"sample": sample, "energy": float(row.energy)})
         if len(candidates) >= k:
             break
+    runtime_ms = (time.perf_counter() - t0) * 1000.0
     return candidates, runtime_ms
 
 
@@ -104,16 +137,16 @@ def rank_assignments(
     return ranked[:k]
 
 
-def count_active_conflicts(full_bqm: dimod.BinaryQuadraticModel, assignment: Assignment) -> Tuple[int, float]:
-    conflict_count = 0
-    conflict_weight = 0.0
+def count_active_positive_couplings(full_bqm: dimod.BinaryQuadraticModel, assignment: Assignment) -> Tuple[int, float]:
+    coupling_count = 0
+    coupling_weight = 0.0
     for (u, v), weight in full_bqm.quadratic.items():
         if float(weight) <= 0:
             continue
         if int(assignment.get(u, 0)) == 1 and int(assignment.get(v, 0)) == 1:
-            conflict_count += 1
-            conflict_weight += float(weight)
-    return conflict_count, conflict_weight
+            coupling_count += 1
+            coupling_weight += float(weight)
+    return coupling_count, coupling_weight
 
 
 def cluster_key(ids: Iterable[int]) -> str:
@@ -147,6 +180,7 @@ def execute_tree_fusion(
     k: int = 2,
     num_reads: int = 20,
 ) -> Dict[str, Any]:
+    validate_sampling_parameters(k, num_reads)
     full_bqm = bqm_from_qubo_payload(qubo)
     clusters: Dict[str, Dict[str, object]] = {}
     execution_steps: List[Dict[str, Any]] = []
@@ -154,6 +188,7 @@ def execute_tree_fusion(
     total_fusion_ms = 0.0
 
     with DWaveSampler() as raw_sampler:
+        solver_id = sampler_solver_id(raw_sampler)
         sampler = EmbeddingComposite(raw_sampler)
 
         for partition in partitions:
@@ -185,7 +220,7 @@ def execute_tree_fusion(
             cluster_bqm = induced_bqm(full_bqm, cluster_vars)
 
             sample_ms = 0.0
-            t0 = time.perf_counter()
+            fusion_t0 = time.perf_counter()
             if merge_strategy == "direct_fusion":
                 merged_assignments = [
                     merge_samples(left_cluster["candidates"][0]["sample"], right_cluster["candidates"][0]["sample"])
@@ -202,11 +237,12 @@ def execute_tree_fusion(
             elif merge_strategy == "conditioned_fusion":
                 fixed_left = left_cluster["candidates"][0]["sample"]
                 conditioned_right_bqm = conditioned_subbqm(full_bqm, fixed_left, right_cluster["variables"])
+                fusion_ms = (time.perf_counter() - fusion_t0) * 1000.0
                 conditioned_candidates, conditioned_ms = sample_top_k(conditioned_right_bqm, sampler, k, num_reads)
+                fusion_t0 = time.perf_counter()
                 if not conditioned_candidates:
                     raise RuntimeError(f"D-Wave returned no conditioned candidates at merge step {step_index}.")
                 sample_ms = conditioned_ms
-                total_sample_ms += conditioned_ms
                 execution_steps.append(
                     {
                         "label": f"Sample conditioned right side for Step {step_index}",
@@ -222,21 +258,28 @@ def execute_tree_fusion(
                 merged_candidates = rank_assignments(cluster_bqm, merged_assignments, k)
             else:
                 raise ValueError(f"Unknown merge strategy: {merge_strategy}")
-            fusion_ms = (time.perf_counter() - t0) * 1000.0
+            if merge_strategy == "conditioned_fusion":
+                fusion_ms += (time.perf_counter() - fusion_t0) * 1000.0
+            else:
+                fusion_ms = (time.perf_counter() - fusion_t0) * 1000.0
+            total_sample_ms += sample_ms
             total_fusion_ms += fusion_ms
 
             best_candidate = merged_candidates[0]
-            conflict_count, _ = count_active_conflicts(cluster_bqm, best_candidate["sample"])
+            active_coupling_count, _ = count_active_positive_couplings(cluster_bqm, best_candidate["sample"])
+            reported_sample_ms = round(sample_ms, 2)
+            reported_fusion_ms = round(fusion_ms, 2)
+            reported_step_runtime_ms = round(reported_sample_ms + reported_fusion_ms, 2)
             execution_steps.append(
                 {
                     "label": f"Merge [{', '.join(f'P{pid + 1}' for pid in left_cluster['partition_ids'])}] with [{', '.join(f'P{pid + 1}' for pid in right_cluster['partition_ids'])}]",
                     "type": "fusion",
-                    "runtime_ms": round(sample_ms + fusion_ms, 2),
-                    "fusion_ms": round(fusion_ms, 2),
-                    "sample_ms": round(sample_ms, 2),
+                    "runtime_ms": reported_step_runtime_ms,
+                    "fusion_ms": reported_fusion_ms,
+                    "sample_ms": reported_sample_ms,
                     "scope_size": len(cluster_vars),
                     "energy": round(best_candidate["energy"], 4),
-                    "conflicts": conflict_count,
+                    "active_positive_coupling_count": active_coupling_count,
                 }
             )
 
@@ -253,15 +296,19 @@ def execute_tree_fusion(
     final_candidate = clusters[root_key]["candidates"][0]
     final_assignment = final_candidate["sample"]
     final_energy = float(full_bqm.energy(final_assignment))
-    conflict_count, conflict_weight = count_active_conflicts(full_bqm, final_assignment)
-    total_runtime_ms = total_sample_ms + total_fusion_ms
+    active_coupling_count, active_coupling_weight = count_active_positive_couplings(full_bqm, final_assignment)
+    reported_sample_ms = round(total_sample_ms, 2)
+    reported_fusion_ms = round(total_fusion_ms, 2)
+    reported_total_runtime_ms = round(reported_sample_ms + reported_fusion_ms, 2)
     execution_steps.append(
         {
             "label": "Final merged assignment",
             "type": "result",
-            "runtime_ms": round(total_runtime_ms, 2),
+            "runtime_ms": reported_total_runtime_ms,
+            "sample_ms": reported_sample_ms,
+            "fusion_ms": reported_fusion_ms,
             "energy": round(final_energy, 4),
-            "conflicts": conflict_count,
+            "active_positive_coupling_count": active_coupling_count,
         }
     )
 
@@ -269,11 +316,15 @@ def execute_tree_fusion(
         "strategy": merge_strategy,
         "merge_order": merge_order,
         "energy": final_energy,
-        "conflict_count": conflict_count,
-        "conflict_weight": round(conflict_weight, 4),
-        "sample_ms": round(total_sample_ms, 2),
-        "fusion_ms": round(total_fusion_ms, 2),
-        "total_runtime_ms": round(total_runtime_ms, 2),
+        "active_positive_coupling_count": active_coupling_count,
+        "active_positive_coupling_weight": round(active_coupling_weight, 4),
+        "candidate_limit": k,
+        "num_reads": num_reads,
+        "solver_id": solver_id,
+        "ocean_versions": installed_ocean_versions(),
+        "sample_ms": reported_sample_ms,
+        "fusion_ms": reported_fusion_ms,
+        "total_runtime_ms": reported_total_runtime_ms,
         "assignment_size": len(final_assignment),
         "execution_steps": execution_steps,
     }

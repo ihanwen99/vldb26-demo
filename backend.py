@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+import os
+import threading
 from dataclasses import dataclass
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Dict, Iterable, List, Tuple
 
 from qubo_construction.index_selection_qubo import build_demo_model as build_index_selection_demo
@@ -12,8 +15,20 @@ from qubo_construction.mqo_qubo import build_demo_model as build_mqo_demo
 
 ProblemPayload = Dict[str, object]
 CACHE_DIR = Path(__file__).resolve().parent / ".cache"
-CACHE_VERSION = "v11"
-REAL_FUSION_CACHE_VERSION = "rf7"
+CACHE_VERSION = "v12"
+REAL_FUSION_CACHE_VERSION = "rf8"
+MERGE_STRATEGIES = ("direct_fusion", "top2_merge", "conditioned_fusion")
+MERGE_ORDERS = ("left_deep", "bushy")
+PLANNER_MODES = ("default", "cost_based")
+PROBLEM_SCALE_BOUNDS = {
+    "join_order": (3, 8),
+    "mqo": (2, 6),
+    "index_selection": (2, 6),
+}
+PARTITION_BOUNDS = (2, 8)
+FUSION_CANDIDATE_LIMIT = 2
+FUSION_NUM_READS = 20
+_QPU_LOCK = threading.Lock()
 
 
 PROBLEM_BUILDERS = {
@@ -28,6 +43,70 @@ PROBLEM_LABELS = {
     "mqo": "Multiple Query Optimization",
     "index_selection": "Index Selection",
 }
+
+
+class LiveFusionDisabledError(RuntimeError):
+    """Raised when a cache miss would require a disabled live QPU call."""
+
+
+def validate_request_parameters(
+    problem: str,
+    scale: int,
+    partitions: int,
+    merge_strategy: str,
+    merge_order: str,
+    planner_mode: str,
+) -> None:
+    if problem not in PROBLEM_BUILDERS:
+        raise KeyError(f"Unknown problem: {problem}")
+    if merge_strategy not in MERGE_STRATEGIES:
+        raise ValueError(f"Unknown merge strategy: {merge_strategy}")
+    if merge_order not in MERGE_ORDERS:
+        raise ValueError(f"Unknown fusion tree structure: {merge_order}")
+    if planner_mode not in PLANNER_MODES:
+        raise ValueError(f"Unknown planner mode: {planner_mode}")
+
+    minimum_scale, maximum_scale = PROBLEM_SCALE_BOUNDS[problem]
+    if not minimum_scale <= scale <= maximum_scale:
+        raise ValueError(
+            f"scale for {problem} must be between {minimum_scale} and {maximum_scale}"
+        )
+    minimum_partitions, maximum_partitions = PARTITION_BOUNDS
+    if not minimum_partitions <= partitions <= maximum_partitions:
+        raise ValueError(
+            f"partitions must be between {minimum_partitions} and {maximum_partitions}"
+        )
+
+
+def _load_cache(cache_path: Path) -> Dict[str, object] | None:
+    if not cache_path.exists():
+        return None
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    payload["cache_hit"] = True
+    return payload
+
+
+def _write_cache(cache_path: Path, payload: Dict[str, object]) -> None:
+    CACHE_DIR.mkdir(exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            "w", encoding="utf-8", dir=CACHE_DIR, delete=False
+        ) as handle:
+            json.dump(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary_path = Path(handle.name)
+        os.replace(temporary_path, cache_path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+
 
 @dataclass
 class Edge:
@@ -44,13 +123,17 @@ def build_problem_payload(
     merge_order: str,
     planner_mode: str = "default",
 ) -> ProblemPayload:
-    cache_key = f"{CACHE_VERSION}_{problem}_s{scale}_p{partitions}_{merge_strategy}_{merge_order}_{planner_mode}.json"
+    validate_request_parameters(
+        problem, scale, partitions, merge_strategy, merge_order, planner_mode
+    )
+    cache_key = (
+        f"{CACHE_VERSION}_{problem}_s{scale}_p{partitions}_"
+        f"{merge_strategy}_{merge_order}_{planner_mode}.json"
+    )
     cache_path = CACHE_DIR / cache_key
-    if cache_path.exists():
-        return json.loads(cache_path.read_text())
-
-    if problem not in PROBLEM_BUILDERS:
-        raise KeyError(f"Unknown problem: {problem}")
+    cached_payload = _load_cache(cache_path)
+    if cached_payload is not None:
+        return cached_payload
 
     base = PROBLEM_BUILDERS[problem](scale)
     graph = qubo_to_graph(base)
@@ -60,17 +143,19 @@ def build_problem_payload(
     metrics = summarize_metrics(graph, partitioning, merge_plan)
 
     payload = {
+        "cache_hit": False,
         "problem_id": problem,
         "problem_label": PROBLEM_LABELS[problem],
         "scale": scale,
+        "requested_partitions": partitions,
+        "effective_partitions": len(partitioning["partitions"]),
         "construction": base,
         "graph": graph,
         "partitioning": partitioning,
         "merge_plan": merge_plan,
         "metrics": metrics,
     }
-    CACHE_DIR.mkdir(exist_ok=True)
-    cache_path.write_text(json.dumps(payload))
+    _write_cache(cache_path, payload)
     return payload
 
 
@@ -81,47 +166,70 @@ def build_real_fusion_payload(
     merge_strategy: str,
     merge_order: str,
     planner_mode: str = "default",
+    allow_live: bool = False,
 ) -> Dict[str, object]:
-    if problem not in PROBLEM_BUILDERS:
-        raise KeyError(f"Unknown problem: {problem}")
-    cache_key = f"{REAL_FUSION_CACHE_VERSION}_{problem}_s{scale}_p{partitions}_{merge_strategy}_{merge_order}_{planner_mode}.json"
-    cache_path = CACHE_DIR / cache_key
-    if cache_path.exists():
-        return json.loads(cache_path.read_text())
-
-    base = PROBLEM_BUILDERS[problem](scale)
-    graph = qubo_to_graph(base)
-    partitioning = decompose_problem(problem, base, graph, max(2, partitions))
-    merge_plan = build_merge_plan(graph, partitioning, merge_strategy, merge_order, planner_mode)
-    from merge_strategy.fusion_runtime import execute_tree_fusion
-    result = execute_tree_fusion(
-        qubo=base["qubo"],
-        partitions=partitioning["partitions"],
-        merge_steps=merge_plan["steps"],
-        merge_strategy=merge_strategy,
-        merge_order=merge_order,
-        k=2,
-        num_reads=20,
+    validate_request_parameters(
+        problem, scale, partitions, merge_strategy, merge_order, planner_mode
     )
-    payload = {
-        "supported": True,
-        "problem_id": problem,
-        "merge_order": merge_order,
-        "planner_mode": planner_mode,
-        "strategy": result["strategy"],
-        "energy": result["energy"],
-        "conflict_count": result["conflict_count"],
-        "conflict_weight": result["conflict_weight"],
-        "sample_ms": result["sample_ms"],
-        "fusion_ms": result["fusion_ms"],
-        "total_runtime_ms": result["total_runtime_ms"],
-        "assignment_size": result["assignment_size"],
-        "execution_steps": result["execution_steps"],
-        "message": "Tree-guided execution completed.",
-    }
-    CACHE_DIR.mkdir(exist_ok=True)
-    cache_path.write_text(json.dumps(payload))
-    return payload
+    cache_key = (
+        f"{REAL_FUSION_CACHE_VERSION}_{problem}_s{scale}_p{partitions}_"
+        f"{merge_strategy}_{merge_order}_{planner_mode}_"
+        f"k{FUSION_CANDIDATE_LIMIT}_r{FUSION_NUM_READS}.json"
+    )
+    cache_path = CACHE_DIR / cache_key
+    cached_payload = _load_cache(cache_path)
+    if cached_payload is not None:
+        cached_payload["message"] = "Replayed a cached fusion result; no QPU job was submitted for this request."
+        return cached_payload
+    if not allow_live:
+        raise LiveFusionDisabledError(
+            "No cached result exists and live QPU execution is disabled. "
+            "Set QFUSION_ENABLE_QPU=1 only in a trusted environment."
+        )
+
+    with _QPU_LOCK:
+        cached_payload = _load_cache(cache_path)
+        if cached_payload is not None:
+            cached_payload["message"] = "Replayed a cached fusion result; no QPU job was submitted for this request."
+            return cached_payload
+
+        base = PROBLEM_BUILDERS[problem](scale)
+        graph = qubo_to_graph(base)
+        partitioning = decompose_problem(problem, base, graph, max(2, partitions))
+        merge_plan = build_merge_plan(graph, partitioning, merge_strategy, merge_order, planner_mode)
+        from merge_strategy.fusion_runtime import execute_tree_fusion
+        result = execute_tree_fusion(
+            qubo=base["qubo"],
+            partitions=partitioning["partitions"],
+            merge_steps=merge_plan["steps"],
+            merge_strategy=merge_strategy,
+            merge_order=merge_order,
+            k=FUSION_CANDIDATE_LIMIT,
+            num_reads=FUSION_NUM_READS,
+        )
+        payload = {
+            "supported": True,
+            "cache_hit": False,
+            "problem_id": problem,
+            "merge_order": merge_order,
+            "planner_mode": planner_mode,
+            "strategy": result["strategy"],
+            "candidate_limit": result["candidate_limit"],
+            "num_reads": result["num_reads"],
+            "solver_id": result["solver_id"],
+            "ocean_versions": result["ocean_versions"],
+            "energy": result["energy"],
+            "active_positive_coupling_count": result["active_positive_coupling_count"],
+            "active_positive_coupling_weight": result["active_positive_coupling_weight"],
+            "sample_ms": result["sample_ms"],
+            "fusion_ms": result["fusion_ms"],
+            "total_runtime_ms": result["total_runtime_ms"],
+            "assignment_size": result["assignment_size"],
+            "execution_steps": result["execution_steps"],
+            "message": "Live tree-guided execution completed on a D-Wave solver.",
+        }
+        _write_cache(cache_path, payload)
+        return payload
 
 
 def qubo_to_graph(base: Dict[str, object]) -> Dict[str, object]:
@@ -219,10 +327,17 @@ def enrich_join_order_blocks(blocks: List[Dict[str, object]], graph: Dict[str, o
     hva_edges = []
     hvb_edges = []
     hp_edges = []
+    hp_nodes = set()
+    same_prefix_edges = []
     for edge in graph["edges"]:
         left_meta = node_meta[edge["source"]]
         right_meta = node_meta[edge["target"]]
         pair = {left_meta["kind"], right_meta["kind"]}
+        if (
+            left_meta.get("join_index") == right_meta.get("join_index")
+            and left_meta.get("join_index") is not None
+        ):
+            same_prefix_edges.append(edge["id"])
         if pair == {"relation_operand_for_join"}:
             same_join = left_meta["join_index"] == right_meta["join_index"]
             same_relation = left_meta.get("relation") == right_meta.get("relation")
@@ -231,14 +346,25 @@ def enrich_join_order_blocks(blocks: List[Dict[str, object]], graph: Dict[str, o
             if same_relation and abs(left_meta["join_index"] - right_meta["join_index"]) == 1:
                 hvb_edges.append(edge["id"])
         if pair == {"predicate_applicable_for_join", "relation_operand_for_join"}:
-            if left_meta["join_index"] == right_meta["join_index"]:
+            predicate_meta, relation_meta = (
+                (left_meta, right_meta)
+                if left_meta["kind"] == "predicate_applicable_for_join"
+                else (right_meta, left_meta)
+            )
+            endpoint_relations = predicate_meta.get("db_element", {}).get("relations", [])
+            if (
+                predicate_meta["join_index"] == relation_meta["join_index"]
+                and relation_meta.get("relation") in endpoint_relations
+            ):
                 hp_edges.append(edge["id"])
+                hp_nodes.update((edge["source"], edge["target"]))
 
     if "HVa" in by_name:
         by_name["HVa"]["highlight"] = {"node_ids": all_roj, "edge_ids": sorted(hva_edges)}
         by_name["HVa"]["focus"] = {
             "node_pattern": "All relation-prefix nodes roj[r,j]",
             "edge_pattern": "Intra-layer roj-roj couplings inside the same join prefix",
+            "overlap_note": "Aggregated roj-roj coefficients can also include HCost contributions.",
         }
     if "HVb" in by_name:
         by_name["HVb"]["highlight"] = {"node_ids": all_roj, "edge_ids": sorted(hvb_edges)}
@@ -247,16 +373,21 @@ def enrich_join_order_blocks(blocks: List[Dict[str, object]], graph: Dict[str, o
             "edge_pattern": "Cross-layer propagation edges for the same relation between adjacent prefixes",
         }
     if "Hp" in by_name:
-        by_name["Hp"]["highlight"] = {"node_ids": sorted(set(all_roj + all_paj)), "edge_ids": sorted(hp_edges)}
+        by_name["Hp"]["highlight"] = {
+            "node_ids": sorted(hp_nodes),
+            "edge_ids": sorted(hp_edges),
+        }
         by_name["Hp"]["focus"] = {
             "node_pattern": "Predicate nodes paj[p,j] plus their endpoint relation nodes roj[left/right,j]",
             "edge_pattern": "Predicate-to-relation applicability edges within the same prefix",
+            "overlap_note": "Aggregated roj-paj coefficients can also include HCost contributions.",
         }
     if "Cost" in by_name:
-        by_name["Cost"]["highlight"] = {"node_ids": sorted(set(all_roj + all_paj)), "edge_ids": []}
+        by_name["Cost"]["highlight"] = {"node_ids": sorted(set(all_roj + all_paj)), "edge_ids": sorted(same_prefix_edges)}
         by_name["Cost"]["focus"] = {
             "node_pattern": "All relation and predicate variables that contribute to the cost term",
-            "edge_pattern": "Linear-only contribution in the current demo model",
+            "edge_pattern": "Within-prefix quadratic couplings from the squared cost approximation",
+            "overlap_note": "The aggregated graph does not separate coefficients shared with HVa or Hp.",
         }
 
 
@@ -314,11 +445,10 @@ def enrich_index_selection_blocks(blocks: List[Dict[str, object]], graph: Dict[s
     storage_edges = []
     conflict_edges = []
     for edge in graph["edges"]:
+        storage_edges.append(edge["id"])
         left_meta = node_meta[edge["source"]]
         right_meta = node_meta[edge["target"]]
         kinds = {left_meta["kind"], right_meta["kind"]}
-        if "storage_fraction" in kinds:
-            storage_edges.append(edge["id"])
         if kinds == {"index_selection"}:
             same_table = left_meta.get("table") == right_meta.get("table")
             both_clustered = left_meta.get("clustered") and right_meta.get("clustered")
@@ -332,7 +462,8 @@ def enrich_index_selection_blocks(blocks: List[Dict[str, object]], graph: Dict[s
         }
         by_name["ES"]["focus"] = {
             "node_pattern": "Index variables plus storage-fraction variables",
-            "edge_pattern": "Capacity-coupling edges that encode the storage budget",
+            "edge_pattern": "All pairwise terms produced by the squared storage-slack expression",
+            "overlap_note": "Clustered-index pairs can also include an EM conflict contribution.",
         }
     if "EM" in by_name:
         conflict_nodes = sorted(
@@ -347,6 +478,7 @@ def enrich_index_selection_blocks(blocks: List[Dict[str, object]], graph: Dict[s
         by_name["EM"]["focus"] = {
             "node_pattern": "Conflicting clustered index candidates on the same table",
             "edge_pattern": "Pairwise penalties that block incompatible choices",
+            "overlap_note": "These aggregated coefficients also include their ES storage contribution.",
         }
     if "EU" in by_name:
         by_name["EU"]["highlight"] = {"node_ids": index_nodes, "edge_ids": []}
@@ -542,15 +674,15 @@ def total_energy(graph: Dict[str, object], assignments: Dict[str, int]) -> float
     return round(energy, 3)
 
 
-def active_conflicts(graph: Dict[str, object], assignments: Dict[str, int], edge_scope: Iterable[Dict[str, object]]) -> List[Dict[str, object]]:
-    conflicts = []
+def active_positive_couplings(graph: Dict[str, object], assignments: Dict[str, int], edge_scope: Iterable[Dict[str, object]]) -> List[Dict[str, object]]:
+    active_couplings = []
     for edge in edge_scope:
         left_active = assignments[edge["source"]]
         right_active = assignments[edge["target"]]
         contribution = edge["value"] * left_active * right_active
         if contribution > 0:
-            conflicts.append({**edge, "contribution": round(contribution, 3)})
-    return sorted(conflicts, key=lambda item: item["contribution"], reverse=True)
+            active_couplings.append({**edge, "contribution": round(contribution, 3)})
+    return sorted(active_couplings, key=lambda item: item["contribution"], reverse=True)
 
 
 def assignment_delta(graph: Dict[str, object], assignments: Dict[str, int], var: str) -> float:
@@ -722,8 +854,10 @@ def build_merge_plan(
     boundary_edges = partitioning["boundary_edges"]
     starting_assignments = partitioning["assignments_before_merge"]
 
-    if merge_order not in ("left_deep", "bushy"):
+    if merge_order not in MERGE_ORDERS:
         raise ValueError(f"Unknown merge order: {merge_order}")
+    if planner_mode not in PLANNER_MODES:
+        raise ValueError(f"Unknown planner mode: {planner_mode}")
 
     if planner_mode == "cost_based":
         # The DP searches every tree shape, so merge_order does not constrain the result.
@@ -734,7 +868,7 @@ def build_merge_plan(
         else:
             merge_sequence = merge_tree_left_deep(partitions)
 
-    if merge_strategy not in ("direct_fusion", "top2_merge", "conditioned_fusion"):
+    if merge_strategy not in MERGE_STRATEGIES:
         raise ValueError(f"Unknown merge strategy: {merge_strategy}")
 
     current_assignments = dict(starting_assignments)
@@ -783,7 +917,7 @@ def build_merge_plan(
             for edge in boundary_edges
             if edge["left_partition"] in merged_so_far or edge["right_partition"] in merged_so_far
         ]
-        conflicts = active_conflicts(graph, current_assignments, visible_boundary)
+        active_couplings = active_positive_couplings(graph, current_assignments, visible_boundary)
         energy = total_energy(graph, current_assignments)
         steps.append(
             {
@@ -792,13 +926,12 @@ def build_merge_plan(
                 "scope_size": len(scope),
                 "boundary_cut": round(boundary_strength_between(child_a, child_b, boundary_edges), 3),
                 "energy": energy,
-                "conflicts": len(conflicts),
-                "runtime_ms": 20 + len(scope) * 3 + step_index * 11,
-                "top_conflicts": conflicts[:6],
+                "active_positive_coupling_count": len(active_couplings),
+                "top_active_positive_couplings": active_couplings[:6],
             }
         )
 
-    final_conflicts = active_conflicts(graph, current_assignments, boundary_edges)
+    final_active_couplings = active_positive_couplings(graph, current_assignments, boundary_edges)
     return {
         "strategy": merge_strategy,
         "order": merge_order,
@@ -807,8 +940,8 @@ def build_merge_plan(
         "steps": steps,
         "final_assignments": current_assignments,
         "final_energy": total_energy(graph, current_assignments),
-        "final_conflict_count": len(final_conflicts),
-        "top_final_conflicts": final_conflicts[:10],
+        "final_active_positive_coupling_count": len(final_active_couplings),
+        "top_final_active_positive_couplings": final_active_couplings[:10],
     }
 
 
@@ -1013,23 +1146,23 @@ def summarize_metrics(
     merge_plan: Dict[str, object],
 ) -> Dict[str, object]:
     before = partitioning["assignments_before_merge"]
-    after = merge_plan["final_assignments"]
-    boundary_conflicts_before = active_conflicts(graph, before, partitioning["boundary_edges"])
-    runtimes = [step["runtime_ms"] for step in merge_plan["steps"]]
+    boundary_active_couplings_before = active_positive_couplings(
+        graph, before, partitioning["boundary_edges"]
+    )
     steps = merge_plan["steps"]
     return {
         "partition_count": len(partitioning["partitions"]),
         "boundary_size": partitioning["boundary_edge_count"],
         "boundary_weight_sum": partitioning["boundary_weight_sum"],
-        "conflict_count_before": len(boundary_conflicts_before),
-        "conflict_count_after": merge_plan["final_conflict_count"],
+        "active_positive_coupling_count_before": len(boundary_active_couplings_before),
+        "active_positive_coupling_count_after": merge_plan["final_active_positive_coupling_count"],
         "energy_before": total_energy(graph, before),
         "energy_after": merge_plan["final_energy"],
         "merge_depth": len(merge_plan["steps"]),
-        "runtime_ms": sum(runtimes),
-        "runtime_series": runtimes,
         "energy_series": [step["energy"] for step in merge_plan["steps"]],
-        "conflict_series": [step["conflicts"] for step in merge_plan["steps"]],
+        "active_positive_coupling_series": [
+            step["active_positive_coupling_count"] for step in merge_plan["steps"]
+        ],
         "max_step_cut": max((s["boundary_cut"] for s in steps), default=0),
         "cut_series": [s["boundary_cut"] for s in steps],
     }

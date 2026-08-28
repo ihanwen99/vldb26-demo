@@ -147,8 +147,9 @@ def build_index_selection_qubo(instance: IndexSelectionInstance) -> Dict[str, ob
         "paper": PAPER_TITLE,
         "paper_url": PAPER_URL,
         "note": (
-            "This module implements the paper's utility term, pairwise clustered-index exclusion term, "
-            "and the first storage-capacity QUBO using binary storage fractions."
+            "This demo builder uses workload-benefit utility, same-table clustered-index exclusion, "
+            "and binary storage-fraction slack variables. It does not model a general incompatibility "
+            "catalog or an optimizer-derived workload-cost function."
         ),
         "qubo": builder.export(),
         "variables": variables,

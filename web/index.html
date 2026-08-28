@@ -131,7 +131,7 @@
               <p class="scenario-tag">Scenario 3</p>
               <h2>Fusion Planning and Execution</h2>
             </div>
-            <p class="scenario-summary">Select a Merge Strategy and Fusion Tree Structure, then trigger Planning.</p>
+            <p class="scenario-summary">Plan locally, then replay a matching cached result or run explicitly enabled D-Wave QPU execution.</p>
           </div>
           <div class="scenario-grid merge-top-grid">
             <section class="panel">
@@ -143,7 +143,7 @@
               <div id="mergeTreeNote" class="step-meta"></div>
               <div class="panel-title merge-subtitle">
                 <h3>Fusion Steps</h3>
-                <p>Per-step runtime; final energy and conflicts.</p>
+                <p>Per-step runtime, final energy, and active positive couplings.</p>
               </div>
               <div id="mergeSteps" class="step-list"></div>
             </section>
@@ -163,8 +163,9 @@
               </div>
               <div class="inline-controls merge-actions">
                 <button id="planBtn" type="button">Plan</button>
-                <button id="mergeBtn" class="primary" type="button">Fusion</button>
+                <button id="mergeBtn" class="primary" type="button">Run Fusion</button>
               </div>
+              <div id="executionModeNote" class="step-meta"></div>
               <div id="strategyNote" class="state-card"></div>
               <div id="metricsGrid" class="metrics-grid"></div>
             </section>
@@ -173,16 +174,16 @@
             <section class="panel">
               <div class="panel-title">
                 <h3>Execution Time</h3>
-                <p>Actual runtime from the executed fusion.</p>
+                <p>Measured runtime from live execution, or the retained measurement from a cached replay.</p>
               </div>
               <svg id="energyChart" class="chart" viewBox="0 0 320 170"></svg>
             </section>
             <section class="panel">
               <div class="panel-title">
                 <h3>Result Summary</h3>
-                <p>Final energy and conflict statistics.</p>
+                <p>Final energy and active positive coupling statistics.</p>
               </div>
-              <svg id="conflictChart" class="chart" viewBox="0 0 320 170"></svg>
+              <svg id="resultChart" class="chart" viewBox="0 0 320 170"></svg>
             </section>
           </div>
         </section>

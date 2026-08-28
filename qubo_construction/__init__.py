@@ -1,1 +1,1 @@
-"""QUBO construction modules for the VLDB demo prototype."""
+"""Problem-specific QUBO builders for the QFusion demo."""

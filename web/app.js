@@ -8,6 +8,7 @@ const state = {
   activePartition: null,
   activeConstructionFilter: null,
   appliedPlannerMode: "default",
+  liveQpuEnabled: false,
 };
 
 const palette = ["#005f73", "#ca6702", "#0a9396", "#ae2012", "#94a51f", "#7f5539", "#5c677d", "#9b2226"];
@@ -22,6 +23,7 @@ const el = {
   mergeOrderSelect: document.getElementById("mergeOrderSelect"),
   planBtn: document.getElementById("planBtn"),
   mergeBtn: document.getElementById("mergeBtn"),
+  executionModeNote: document.getElementById("executionModeNote"),
   graphModeBtn: document.getElementById("graphModeBtn"),
   matrixModeBtn: document.getElementById("matrixModeBtn"),
   refreshBtn: document.getElementById("refreshBtn"),
@@ -38,17 +40,33 @@ const el = {
   mergeSteps: document.getElementById("mergeSteps"),
   quboSubtitle: document.getElementById("quboSubtitle"),
   energyChart: document.getElementById("energyChart"),
-  conflictChart: document.getElementById("conflictChart"),
+  resultChart: document.getElementById("resultChart"),
   mergeTree: document.getElementById("mergeTree"),
 };
 
-async function fetchJson(url) {
-  const response = await fetch(url);
-  return await response.json();
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, options);
+  const responseText = await response.text();
+  let payload = null;
+  try {
+    payload = responseText ? JSON.parse(responseText) : null;
+  } catch (error) {
+    const invalidJsonError = new Error(`Server returned invalid JSON (HTTP ${response.status}).`);
+    invalidJsonError.status = response.status;
+    throw invalidJsonError;
+  }
+  if (!response.ok) {
+    const requestError = new Error(payload?.error || `Request failed with HTTP ${response.status}.`);
+    requestError.status = response.status;
+    requestError.errorCode = payload?.error_code || "request_failed";
+    throw requestError;
+  }
+  return payload;
 }
 
 async function bootstrap() {
   const catalog = await fetchJson("/api/catalog");
+  state.liveQpuEnabled = catalog.live_qpu_enabled === true;
   fillSelect(el.problemSelect, catalog.problems.map((item) => ({ value: item.id, label: item.label })));
   el.problemSelect.value = "join_order";
   el.scaleSlider.value = "8";
@@ -56,9 +74,13 @@ async function bootstrap() {
   el.partitionSlider.value = "7";
   el.partitionValue.textContent = "7";
   fillSelect(el.mergeStrategySelect, catalog.merge_strategies.map((value) => ({ value, label: friendlyMergeStrategyName(value) })));
+  el.mergeStrategySelect.value = "direct_fusion";
   if (el.mergeOrderSelect && Array.isArray(catalog.merge_orders)) {
     fillSelect(el.mergeOrderSelect, catalog.merge_orders.map((value) => ({ value, label: friendlyMergeOrderName(value) })));
   }
+  el.executionModeNote.textContent = state.liveQpuEnabled
+    ? "Live QPU is enabled. A cache miss can submit a D-Wave job."
+    : "Live QPU is disabled. Fusion can only replay an existing matching cache entry.";
   wireEvents();
   await loadPayload();
 }
@@ -127,7 +149,7 @@ async function loadPayloadForPlanner(plannerMode) {
     problem: el.problemSelect.value || "join_order",
     scale: el.scaleSlider.value,
     partitions: el.partitionSlider.value,
-    merge_strategy: el.mergeStrategySelect.value || "top2_merge",
+    merge_strategy: el.mergeStrategySelect.value || "direct_fusion",
     merge_order: selectedMergeOrder(),
     planner_mode: plannerMode,
   });
@@ -159,25 +181,29 @@ async function planFusionTree() {
 async function runFusion() {
   el.mergeBtn.disabled = true;
   el.mergeBtn.textContent = "Running...";
-  await loadPayload();
-  const params = new URLSearchParams({
-    problem: el.problemSelect.value || "join_order",
-    scale: el.scaleSlider.value,
-    partitions: el.partitionSlider.value,
-    merge_strategy: el.mergeStrategySelect.value || "top2_merge",
-    merge_order: selectedMergeOrder(),
-    planner_mode: state.payload?.merge_plan?.planner_mode || state.appliedPlannerMode || "default",
-  });
   try {
-    state.fusionResult = await fetchJson(`/api/fusion?${params.toString()}`);
+    await loadPayload();
+    const params = new URLSearchParams({
+      problem: el.problemSelect.value || "join_order",
+      scale: el.scaleSlider.value,
+      partitions: el.partitionSlider.value,
+      merge_strategy: el.mergeStrategySelect.value || "direct_fusion",
+      merge_order: selectedMergeOrder(),
+      planner_mode: state.payload?.merge_plan?.planner_mode || state.appliedPlannerMode || "default",
+    });
+    state.fusionResult = await fetchJson(`/api/fusion?${params.toString()}`, {
+      method: "POST",
+      headers: { "X-QFusion-Confirm": "run-fusion" },
+    });
   } catch (error) {
     state.fusionResult = {
       supported: false,
       message: `Fusion request failed: ${error.message || error}`,
+      error_code: error.errorCode || "request_failed",
     };
   } finally {
     el.mergeBtn.disabled = false;
-    el.mergeBtn.textContent = "Fusion";
+    el.mergeBtn.textContent = "Run Fusion";
   }
   renderMetrics();
   renderStrategyNote();
@@ -208,7 +234,7 @@ function currentControlState() {
   return {
     problem: el.problemSelect.value || "join_order",
     scale: Number(el.scaleSlider.value),
-    mergeStrategy: el.mergeStrategySelect.value || "top2_merge",
+    mergeStrategy: el.mergeStrategySelect.value || "direct_fusion",
     mergeOrder: selectedMergeOrder(),
     plannerMode: state.payload?.merge_plan?.planner_mode || state.appliedPlannerMode || "default",
   };
@@ -763,6 +789,7 @@ function renderConstructionBlocks() {
       <div class="step-meta">${block.meaning}</div>
       <div class="step-meta">Variables: ${block.variables.join(", ")}</div>
       ${block.focus ? `<div class="focus-note">Nodes: ${block.focus.node_pattern}</div><div class="focus-note">Edges: ${block.focus.edge_pattern}</div>` : ""}
+      ${block.focus?.overlap_note ? `<div class="focus-note">Overlap: ${block.focus.overlap_note}</div>` : ""}
     </button>
   `).join("");
   el.constructionBlocks.querySelectorAll("[data-block-name]").forEach((button) => {
@@ -1671,12 +1698,20 @@ function familyOrder(problem, kind) {
 }
 
 function renderMetrics() {
+  const requestedPartitions = state.payload.requested_partitions ?? state.payload.metrics.partition_count;
+  const effectivePartitions = state.payload.effective_partitions ?? state.payload.metrics.partition_count;
   const metrics = state.payload.metrics;
   const fusion = state.fusionResult;
   const cards = [
-    ["Partitions", metrics.partition_count],
+    ["Partitions (effective/requested)", `${effectivePartitions}/${requestedPartitions}`],
     ["Merge Depth", metrics.merge_depth],
     ["Total Boundary Coupling", formatCompact(metrics.boundary_weight_sum)],
+    ["Active Positive Couplings", fusion?.supported
+      ? fusion.active_positive_coupling_count
+      : metrics.active_positive_coupling_count_after],
+    ["Active Positive Weight", fusion?.supported
+      ? formatCompact(fusion.active_positive_coupling_weight)
+      : "--"],
     ["Tree Cost", state.payload.merge_plan?.tree_cost !== undefined ? formatCompact(state.payload.merge_plan.tree_cost) : "--"],
     ["Sample Time (ms)", fusion?.supported ? formatCompact(fusion.sample_ms) : "--"],
     ["Fusion Time (ms)", fusion?.supported ? formatCompact(fusion.fusion_ms) : "--"],
@@ -1689,13 +1724,13 @@ function renderMetrics() {
 }
 
 function renderStrategyNote() {
-  const selectedStrategy = el.mergeStrategySelect.value || "top2_merge";
+  const selectedStrategy = el.mergeStrategySelect.value || "direct_fusion";
   const notes = {
     direct_fusion: {
       text: "Directly combine variables from both sides after sampling.",
     },
     top2_merge: {
-      text: "Use the top-2 candidate pairs from the two sides and keep the merged assignment with the lowest energy.",
+      text: "Take up to two candidates from each child, evaluate at most four pairwise merges, and retain up to two lowest-energy unique assignments.",
     },
     conditioned_fusion: {
       text: "Fix the sampling decision on the left side, then condition the boundary variables on the right side.",
@@ -1703,15 +1738,19 @@ function renderStrategyNote() {
   };
   const note = notes[selectedStrategy] || { text: "" };
   const fusion = state.fusionResult;
-  let detail = "";
+  const details = [];
   if (fusion) {
-    detail = fusion.supported
-      ? `${fusion.message}<br>Assignment: ${fusion.assignment_size} variables.`
-      : fusion.message;
+    details.push(fusion.message || "Fusion request completed without a message.");
+    if (fusion.supported) {
+      details.push(`Source: ${fusion.cache_hit ? "cached replay; no QPU job submitted" : "live D-Wave execution"}.`);
+      details.push(`Assignment: ${fusion.assignment_size} variables.`);
+    } else if (fusion.error_code) {
+      details.push(`Error code: ${fusion.error_code}.`);
+    }
   }
   el.strategyNote.innerHTML = `
-    <div class="step-meta">${note.text}</div>
-    ${detail ? `<div class="step-meta">${detail}</div>` : ""}
+    <div class="step-meta">${escapeHtml(note.text)}</div>
+    ${details.map((detail) => `<div class="step-meta">${escapeHtml(detail)}</div>`).join("")}
   `;
 }
 
@@ -1728,7 +1767,7 @@ function renderMergeSteps() {
       const extra = [];
       if (step.type === "result") {
         extra.push(`Final energy ${formatCompact(step.energy)}`);
-        extra.push(`Conflicts ${step.conflicts}`);
+        extra.push(`Active positive couplings ${step.active_positive_coupling_count}`);
       }
       card.innerHTML = `
         <h4>Step ${index + 1}: ${step.label}</h4>
@@ -1748,7 +1787,8 @@ function renderMergeSteps() {
     card.innerHTML = `
       <h4>Step ${step.step}: Merge [${step.cluster.map((value) => value + 1).join(", ")}]</h4>
       <div class="step-meta">Planned merge scope ${step.scope_size}</div>
-      <div class="step-meta" title="Largest boundary weight reconciled in a single merge step; grows for bushy trees and bounds the hardest sub-problem a solver must handle at once.">Boundary cut ${formatCompact(step.boundary_cut)}</div>
+      <div class="step-meta" title="Sum of absolute QUBO coupling weights crossing the two children merged at this step.">Boundary cut ${formatCompact(step.boundary_cut)}</div>
+      <div class="step-meta">Active positive couplings ${step.active_positive_coupling_count}</div>
       ${plannerChanged ? `<div class="step-meta">Planner changed this merge step.</div>` : ""}
     `;
     el.mergeSteps.appendChild(card);
@@ -1768,11 +1808,11 @@ function renderFusionCharts() {
   const fusion = state.fusionResult;
   if (fusion?.supported) {
     renderRuntimeBreakdownChart(el.energyChart, fusion);
-    renderResultSummaryChart(el.conflictChart, fusion);
+    renderResultSummaryChart(el.resultChart, fusion);
     return;
   }
   el.energyChart.innerHTML = "";
-  el.conflictChart.innerHTML = "";
+  el.resultChart.innerHTML = "";
 }
 
 function renderRuntimeBreakdownChart(svg, fusion) {
@@ -1787,10 +1827,10 @@ function renderRuntimeBreakdownChart(svg, fusion) {
 function renderResultSummaryChart(svg, fusion) {
   const items = [
     { label: "Energy", value: fusion.energy, color: "#ae2012" },
-    { label: "Conflicts", value: fusion.conflict_count, color: "#bb3e03" },
-    { label: "Weight", value: fusion.conflict_weight, color: "#7f5539" },
+    { label: "Positive #", value: fusion.active_positive_coupling_count, color: "#bb3e03" },
+    { label: "Positive Wt", value: fusion.active_positive_coupling_weight, color: "#7f5539" },
   ];
-  renderMetricBars(svg, items, "Final Result");
+  renderMetricBars(svg, items, "Final Energy and Active Positive Couplings");
 }
 
 function renderMetricBars(svg, items, title) {
@@ -1803,23 +1843,29 @@ function renderMetricBars(svg, items, title) {
   const bottom = 28;
   const chartWidth = width - left - right;
   const chartHeight = height - top - bottom;
-  const max = Math.max(...items.map((item) => Number(item.value) || 0), 1);
+  const values = items.map((item) => Number(item.value) || 0);
+  const minimum = Math.min(0, ...values);
+  const maximum = Math.max(0, ...values);
+  const span = maximum - minimum || 1;
+  const yForValue = (value) => top + ((maximum - value) / span) * chartHeight;
+  const zeroY = yForValue(0);
   const barWidth = Math.min(52, chartWidth / Math.max(items.length * 1.8, 1));
   const gap = items.length > 1 ? (chartWidth - items.length * barWidth) / (items.length - 1) : 0;
 
   const baseline = document.createElementNS("http://www.w3.org/2000/svg", "line");
   baseline.setAttribute("x1", left);
-  baseline.setAttribute("y1", height - bottom);
+  baseline.setAttribute("y1", zeroY);
   baseline.setAttribute("x2", width - right);
-  baseline.setAttribute("y2", height - bottom);
+  baseline.setAttribute("y2", zeroY);
   baseline.setAttribute("stroke", "rgba(0,0,0,0.18)");
   svg.appendChild(baseline);
 
   items.forEach((item, index) => {
     const value = Number(item.value) || 0;
-    const barHeight = (value / max) * chartHeight;
+    const valueY = yForValue(value);
+    const barHeight = Math.abs(zeroY - valueY);
     const x = left + index * (barWidth + gap);
-    const y = height - bottom - barHeight;
+    const y = Math.min(zeroY, valueY);
 
     const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
     rect.setAttribute("x", x);
@@ -1833,7 +1879,14 @@ function renderMetricBars(svg, items, title) {
 
     const valueLabel = document.createElementNS("http://www.w3.org/2000/svg", "text");
     valueLabel.setAttribute("x", x + barWidth / 2);
-    valueLabel.setAttribute("y", Math.max(y - 8, top + 8));
+    const negativeLabelInsideBar = value < 0 && barHeight >= 18;
+    const valueLabelY = value >= 0
+      ? Math.max(y - 8, top + 8)
+      : negativeLabelInsideBar
+        ? y + barHeight - 6
+        : Math.min(zeroY + 14, height - bottom - 4);
+    valueLabel.setAttribute("y", valueLabelY);
+    valueLabel.setAttribute("fill", negativeLabelInsideBar ? "#ffffff" : "#1f2d2f");
     valueLabel.setAttribute("text-anchor", "middle");
     valueLabel.setAttribute("font-size", "10");
     valueLabel.setAttribute("font-family", "Trebuchet MS, sans-serif");
@@ -2060,6 +2113,15 @@ function drawTreeLeaf(svg, x, y, label) {
   svg.appendChild(text);
 }
 
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (character) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "\"": "&quot;",
+    "'": "&#39;",
+  })[character]);
+}
 function shortName(name) { return name.replace(/^.*::/, "").slice(0, 18); }
 function pretty(text) { return text.replaceAll("_", " ").replace(/\b\w/g, (char) => char.toUpperCase()); }
 function friendlyMergeStrategyName(value) {
@@ -2102,4 +2164,9 @@ function formatCompact(value) {
   return num.toFixed(2).replace(/\.?0+$/, "");
 }
 
-bootstrap();
+bootstrap().catch((error) => {
+  console.error(error);
+  if (el.strategyNote) {
+    el.strategyNote.textContent = `Demo initialization failed: ${error.message || error}`;
+  }
+});

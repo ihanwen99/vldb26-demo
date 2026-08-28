@@ -1,58 +1,33 @@
 # QFusion: A Demonstration of Boundary-Aware Fusion Planning and Execution for Large-Scale QUBO Optimization
 
-QFusion is an interactive demonstration (PVLDB Vol. 19, No. 12, VLDB 2026) that shows how large-scale QUBO optimization problems are constructed, decomposed along their boundaries, and solved by boundary-aware fusion planning and execution on a real quantum annealer. It covers three database optimization problems: Join Order, Multiple Query Optimization, and Index Selection.
+QFusion is the interactive artifact for our VLDB 2026 demonstration. It presents a boundary-aware approach for decomposing large QUBO problems and combining their partial solutions through a fusion tree. The demo covers three database optimization problems: Join Order, Multiple Query Optimization, and Index Selection.
 
-## Requirements / Install
+The demonstration is organized into three scenarios:
 
-Python 3.9+.
+1. **QUBO Construction and Database Semantics:** build a problem-specific QUBO and inspect its graph or matrix together with the corresponding database elements.
+2. **Decomposition and Boundary Inspection:** partition the QUBO using database semantics and examine the couplings that cross partition boundaries.
+3. **Fusion Planning and Execution:** construct a fusion tree and compare Direct Fusion, Top-2 Merge, and Conditioned Fusion on a D-Wave quantum annealer.
+
+The repository uses self-contained demo instances and does not require a database, an external dataset, Node.js, or a frontend build step.
+
+## Requirements
+
+- Python 3.9+
+- A D-Wave Leap account and API token
+
+## Full Fusion with D-Wave
 
 ```bash
-pip install -r requirements.txt
+git clone https://github.com/ihanwen99/vldb26-demo.git
+cd vldb26-demo
+python3.9 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+dwave config create
+QFUSION_ENABLE_QPU=1 python app.py
 ```
 
-`dimod` and `dwave-system` are only needed for Scenario 3 execution; Scenarios 1 and 2 run on the Python standard library alone.
-
-## Run
-
-```bash
-python demo_app.py
-```
-
-Then open `http://127.0.0.1:8000` in a browser.
-
-The host and port default to `127.0.0.1` and `8000`. Set `VLDB_DEMO_HOST` and `VLDB_DEMO_PORT` to override the defaults.
-
-## Scenarios
-
-### Scenario 1: QUBO Construction
-
-Build a problem-specific QUBO and inspect it as a graph or matrix alongside its database semantics.
-
-### Scenario 2: Decomposition and Boundary
-
-Split the QUBO into partitions and inspect the resulting subproblems and cut boundaries.
-
-### Scenario 3: Fusion Planning and Execution
-
-Configure the fusion, plan it, then run the actual execution:
-
-- Merge Strategy: Direct Fusion, Top-2 Merge, Conditioned Fusion
-- Fusion Tree Structure: Linear, Bushy (the default tree before planning)
-- Plan: rewrites the default tree with the cost-based fusion planner. The planner scores a tree by summing, over its merges, the boundary coupling between the two merged sides weighted by the number of blocks the merge produces, and finds the lowest-cost tree exactly with a subset dynamic program over the blocks. The resulting tree cost is reported next to the plan.
-
-## D-Wave Setup
-
-Scenario 3 executes on a real D-Wave quantum annealer and needs D-Wave Leap credentials: run `dwave config create` or set the `DWAVE_API_TOKEN` environment variable. Scenarios 1 and 2 work without D-Wave.
-
-## Project Structure
-
-```text
-demo_app.py         Main entrance (HTTP server)
-demo_backend.py     Payload generation, decomposition, boundary summaries, fusion planning (cost model + subset DP)
-merge_strategy/     Quantum-backed fusion runtime
-qubo_construction/  Database problem-specific QUBO builders
-web/                Frontend UI
-```
+Open `http://127.0.0.1:8000` in a browser.
 
 ## Citation
 
@@ -71,4 +46,4 @@ web/                Frontend UI
 
 ## License
 
-GPL-3.0 (see `LICENSE`). QFusion derives its QUBO formulations from prior work; the modules under `qubo_construction/` cite their source papers and repositories in their `PAPER_*` constants.
+QFusion is distributed under `GPL-3.0-only`; see `LICENSE`.
