@@ -1,4 +1,17 @@
 .cache/
+.env
+.env.*
+!.env.example
+dwave.conf
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
 .idea/
+.vscode/
+.DS_Store
+
+# Local runtime artifacts
+*.log

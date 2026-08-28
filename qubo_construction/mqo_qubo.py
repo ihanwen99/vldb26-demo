@@ -5,9 +5,10 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Tuple
 
 
-PAPER_TITLE = "Large-Scale Multiple Query Optimisation with Incremental Quantum(-Inspired) Annealing"
-PAPER_REPO_URL = "https://github.com/lfd/sigmod26"
-RELATED_BASELINE_REPO_URL = "https://github.com/itrummer/quantumdb"
+BASE_PAPER_TITLE = "Multiple Query Optimization on the D-Wave 2X Adiabatic Quantum Computer"
+BASE_REPO_URL = "https://github.com/itrummer/quantumdb"
+RELATED_PAPER_TITLE = "Large-Scale Multiple Query Optimisation with Incremental Quantum(-Inspired) Annealing"
+RELATED_REPO_URL = "https://github.com/lfd/sigmod26"
 
 
 @dataclass(frozen=True)
@@ -101,9 +102,16 @@ def build_mqo_qubo(instance: MQOInstance) -> Dict[str, object]:
         saving.value for saving in instance.savings
     )
     minimum_safe_weight = default_weight + 1.0
-    exactly_one_weight = minimum_safe_weight if instance.exactly_one_weight is None else float(instance.exactly_one_weight)
+    exactly_one_weight = (
+        minimum_safe_weight
+        if instance.exactly_one_weight is None
+        else float(instance.exactly_one_weight)
+    )
     if exactly_one_weight < minimum_safe_weight:
-        raise ValueError(f"exactly_one_weight is too small to dominate MQO costs/savings: got {exactly_one_weight}, require at least {minimum_safe_weight}")
+        raise ValueError(
+            "exactly_one_weight is too small to dominate MQO costs/savings: "
+            f"got {exactly_one_weight}, require at least {minimum_safe_weight}"
+        )
 
     # Classical MQO QUBO:
     # sum plan costs - sum pairwise savings + lambda * sum_q (sum_{p in P_q} x_p - 1)^2
@@ -127,13 +135,14 @@ def build_mqo_qubo(instance: MQOInstance) -> Dict[str, object]:
     ]
 
     return {
-        "paper": PAPER_TITLE,
-        "repo_url": PAPER_REPO_URL,
-        "related_repo_url": RELATED_BASELINE_REPO_URL,
+        "paper": BASE_PAPER_TITLE,
+        "repo_url": BASE_REPO_URL,
+        "related_paper": RELATED_PAPER_TITLE,
+        "related_repo_url": RELATED_REPO_URL,
         "note": (
-            "This module implements the core MQO QUBO used by quantum/quantum-inspired solvers. "
-            "The SIGMOD 2025 paper adds incremental partitioning and dynamic search steering on top "
-            "of this base plan-selection encoding."
+            "This demo builder models plan selection, plan cost, and pairwise cross-query reuse savings. "
+            "It does not model explicit materialized-intermediate variables or materialization costs. "
+            "The related SIGMOD 2026 system adds incremental partitioning and dynamic search steering."
         ),
         "qubo": builder.export(),
         "variables": variables,

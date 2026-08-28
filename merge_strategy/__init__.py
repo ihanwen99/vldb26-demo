@@ -1,6 +1,6 @@
 from .fusion_runtime import (
     bqm_from_qubo_payload,
-    count_active_conflicts,
+    count_active_positive_couplings,
     execute_tree_fusion,
     induced_bqm,
     merge_samples,
@@ -9,7 +9,7 @@ from .fusion_runtime import (
 
 __all__ = [
     "bqm_from_qubo_payload",
-    "count_active_conflicts",
+    "count_active_positive_couplings",
     "execute_tree_fusion",
     "induced_bqm",
     "merge_samples",
