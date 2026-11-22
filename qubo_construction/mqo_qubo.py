@@ -1,0 +1,196 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List
+
+from .qubo_builder import QuboBuilder
+
+
+BASE_PAPER_TITLE = (
+    "Multiple Query Optimization on the D-Wave 2X Adiabatic Quantum Computer"
+)
+BASE_REPO_URL = "https://github.com/itrummer/quantumdb"
+RELATED_PAPER_TITLE = "Large-Scale Multiple Query Optimisation with Incremental Quantum(-Inspired) Annealing"
+RELATED_REPO_URL = "https://github.com/lfd/sigmod26"
+
+
+@dataclass(frozen=True)
+class Plan:
+    name: str
+    query: str
+    cost: float
+
+
+@dataclass(frozen=True)
+class PlanPairSaving:
+    left_plan: str
+    right_plan: str
+    value: float
+
+
+@dataclass
+class MQOInstance:
+    plans: List[Plan]
+    savings: List[PlanPairSaving]
+    exactly_one_weight: float | None = None
+
+
+def plan_var(plan_name: str) -> str:
+    return f"plan::{plan_name}"
+
+
+def build_mqo_qubo(instance: MQOInstance) -> Dict[str, object]:
+    builder = QuboBuilder()
+    plans_by_query: Dict[str, List[Plan]] = {}
+
+    for plan in instance.plans:
+        plans_by_query.setdefault(plan.query, []).append(plan)
+        builder.add_linear(plan_var(plan.name), plan.cost)
+
+    query_by_plan: Dict[str, str] = {plan.name: plan.query for plan in instance.plans}
+
+    for saving in instance.savings:
+        if saving.left_plan not in query_by_plan:
+            raise ValueError(f"savings references unknown plan: {saving.left_plan}")
+        if saving.right_plan not in query_by_plan:
+            raise ValueError(f"savings references unknown plan: {saving.right_plan}")
+        if query_by_plan[saving.left_plan] == query_by_plan[saving.right_plan]:
+            raise ValueError(
+                f"savings edge connects two plans of the same query "
+                f"({saving.left_plan}, {saving.right_plan}) in query {query_by_plan[saving.left_plan]}; "
+                f"these plans are mutually exclusive so the reward is spurious"
+            )
+        builder.add_quadratic(
+            plan_var(saving.left_plan), plan_var(saving.right_plan), -saving.value
+        )
+
+    default_weight = max((plan.cost for plan in instance.plans), default=1.0) + sum(
+        saving.value for saving in instance.savings
+    )
+    minimum_safe_weight = default_weight + 1.0
+    exactly_one_weight = (
+        minimum_safe_weight
+        if instance.exactly_one_weight is None
+        else float(instance.exactly_one_weight)
+    )
+    if exactly_one_weight < minimum_safe_weight:
+        raise ValueError(
+            "exactly_one_weight is too small to dominate MQO costs/savings: "
+            f"got {exactly_one_weight}, require at least {minimum_safe_weight}"
+        )
+
+    for query, query_plans in plans_by_query.items():
+        builder.add_square(
+            ((plan_var(plan.name), 1.0) for plan in query_plans),
+            target=1.0,
+            weight=exactly_one_weight,
+        )
+
+    variables = [
+        {
+            "name": plan_var(plan.name),
+            "kind": "plan_selection",
+            "query": plan.query,
+            "plan": plan.name,
+            "cost": plan.cost,
+            "db_element": {"type": "plan", "query": plan.query, "name": plan.name},
+        }
+        for plan in instance.plans
+    ]
+
+    return {
+        "paper": BASE_PAPER_TITLE,
+        "repo_url": BASE_REPO_URL,
+        "related_paper": RELATED_PAPER_TITLE,
+        "related_repo_url": RELATED_REPO_URL,
+        "note": (
+            "This demo builder models plan selection, plan cost, and pairwise cross-query reuse savings. "
+            "It does not model explicit materialized-intermediate variables or materialization costs. "
+            "The related SIGMOD 2026 system adds incremental partitioning and dynamic search steering."
+        ),
+        "qubo": builder.to_payload(),
+        "variables": variables,
+        "construction_blocks": [
+            {
+                "name": "HSel",
+                "title": "Plan Selection",
+                "formula": "sum_q (sum_{p in P_q} x_p - 1)^2",
+                "meaning": "Force each query to keep exactly one execution plan.",
+                "variables": ["plan"],
+            },
+            {
+                "name": "HShare",
+                "title": "Shared Reuse",
+                "formula": "-sum s_ij x_i x_j",
+                "meaning": "Reward compatible plans that can share intermediate work across queries.",
+                "variables": ["plan"],
+            },
+            {
+                "name": "HCost",
+                "title": "Execution Cost",
+                "formula": "sum c_i x_i",
+                "meaning": "Model the execution cost contributed by the selected plans.",
+                "variables": ["plan"],
+            },
+        ],
+        "viz": {
+            "query_groups": [
+                {
+                    "query": query,
+                    "plan_vars": [plan_var(plan.name) for plan in query_plans],
+                }
+                for query, query_plans in sorted(plans_by_query.items())
+            ],
+            "mqo_graph": {
+                "nodes": [
+                    {
+                        "id": plan.name,
+                        "label": plan.name,
+                        "query": plan.query,
+                        "cost": plan.cost,
+                    }
+                    for plan in instance.plans
+                ],
+                "edges": [
+                    {
+                        "source": saving.left_plan,
+                        "target": saving.right_plan,
+                        "saving": saving.value,
+                    }
+                    for saving in instance.savings
+                ],
+            },
+        },
+    }
+
+
+def build_demo_qubo(scale: int = 3) -> Dict[str, object]:
+    num_queries = max(2, min(scale, 6))
+    plans: List[Plan] = []
+    savings: List[PlanPairSaving] = []
+    for query_idx in range(num_queries):
+        query_name = f"q{query_idx + 1}"
+        for plan_offset in range(2):
+            plan_id = query_idx * 2 + plan_offset + 1
+            plans.append(
+                Plan(f"p{plan_id}", query_name, 9.0 + ((query_idx + plan_offset) % 4))
+            )
+    for query_idx in range(num_queries - 1):
+        left_a = f"p{query_idx * 2 + 1}"
+        left_b = f"p{query_idx * 2 + 2}"
+        right_a = f"p{(query_idx + 1) * 2 + 1}"
+        right_b = f"p{(query_idx + 1) * 2 + 2}"
+        savings.extend(
+            [
+                PlanPairSaving(left_a, right_a, 1.0 + query_idx),
+                PlanPairSaving(left_b, right_b, 3.0 + query_idx),
+            ]
+        )
+        if query_idx + 2 < num_queries:
+            far = f"p{(query_idx + 2) * 2 + 1}"
+            savings.append(PlanPairSaving(left_b, far, 2.0 + 0.5 * query_idx))
+    instance = MQOInstance(
+        plans=plans,
+        savings=savings,
+    )
+    return build_mqo_qubo(instance)

@@ -1,0 +1,446 @@
+from __future__ import annotations
+
+from importlib.metadata import PackageNotFoundError, version
+import time
+from typing import Any, Dict, Iterable, List, Tuple
+
+import dimod
+from dwave.system import DWaveSampler, EmbeddingComposite
+
+
+Assignment = Dict[Any, int]
+Candidate = Dict[str, Any]
+
+
+def get_ocean_versions() -> Dict[str, str]:
+    versions: Dict[str, str] = {}
+    for distribution in ("dimod", "dwave-system", "dwave-cloud-client", "minorminer"):
+        try:
+            versions[distribution] = version(distribution)
+        except PackageNotFoundError:
+            versions[distribution] = "not-installed"
+    return versions
+
+
+def get_solver_id(raw_sampler: Any) -> str:
+    solver = getattr(raw_sampler, "solver", None)
+    solver_id = getattr(solver, "id", None)
+    if solver_id:
+        return str(solver_id)
+
+    properties = getattr(raw_sampler, "properties", {})
+    if isinstance(properties, dict):
+        chip_id = properties.get("chip_id")
+        if chip_id:
+            return str(chip_id)
+    return "unknown"
+
+
+def validate_sampling_parameters(k: int, num_reads: int) -> None:
+    if k < 1:
+        raise ValueError(f"k must be at least 1, got {k}")
+    if num_reads < 1:
+        raise ValueError(f"num_reads must be at least 1, got {num_reads}")
+
+
+def build_bqm_from_qubo(qubo: Dict[str, object]) -> dimod.BinaryQuadraticModel:
+    linear = {name: float(value) for name, value in qubo["linear"].items()}
+    quadratic = {
+        (item["u"], item["v"]): float(item["value"]) for item in qubo["quadratic"]
+    }
+    return dimod.BinaryQuadraticModel(
+        linear, quadratic, float(qubo.get("offset", 0.0)), dimod.BINARY
+    )
+
+
+def build_induced_bqm(
+    full_bqm: dimod.BinaryQuadraticModel, variables: Iterable[Any]
+) -> dimod.BinaryQuadraticModel:
+    scope = set(variables)
+    linear = {
+        var: float(full_bqm.linear[var]) for var in scope if var in full_bqm.linear
+    }
+    quadratic = {
+        (u, v): float(weight)
+        for (u, v), weight in full_bqm.quadratic.items()
+        if u in scope and v in scope
+    }
+    return dimod.BinaryQuadraticModel(linear, quadratic, 0.0, full_bqm.vartype)
+
+
+def build_conditioned_bqm(
+    full_bqm: dimod.BinaryQuadraticModel,
+    fixed: Assignment,
+    remaining_variables: Iterable[Any],
+) -> dimod.BinaryQuadraticModel:
+    scope = set(remaining_variables)
+    linear: Dict[Any, float] = {}
+    quadratic: Dict[Tuple[Any, Any], float] = {}
+    offset = 0.0
+
+    for var in scope:
+        linear[var] = float(full_bqm.linear.get(var, 0.0))
+
+    for (u, v), weight in full_bqm.quadratic.items():
+        if u in fixed and v in fixed:
+            offset += float(weight) * fixed[u] * fixed[v]
+        elif u in fixed and v in scope:
+            linear[v] = linear.get(v, 0.0) + float(weight) * fixed[u]
+        elif v in fixed and u in scope:
+            linear[u] = linear.get(u, 0.0) + float(weight) * fixed[v]
+        elif u in scope and v in scope:
+            quadratic[(u, v)] = float(weight)
+
+    return dimod.BinaryQuadraticModel(linear, quadratic, offset, full_bqm.vartype)
+
+
+def sample_top_k(
+    bqm: dimod.BinaryQuadraticModel,
+    sampler: EmbeddingComposite,
+    k: int,
+    num_reads: int,
+) -> Tuple[List[Candidate], float]:
+    validate_sampling_parameters(k, num_reads)
+    t0 = time.perf_counter()
+    sampleset = sampler.sample(bqm, num_reads=num_reads)
+
+    candidates: List[Candidate] = []
+    seen = set()
+    for row in sampleset.data(["sample", "energy"]):
+        sample = {var: int(value) for var, value in row.sample.items()}
+        key = tuple(sorted(sample.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append({"sample": sample, "energy": float(row.energy)})
+        if len(candidates) >= k:
+            break
+    runtime_ms = (time.perf_counter() - t0) * 1000.0
+    return candidates, runtime_ms
+
+
+def merge_samples(left: Assignment, right: Assignment) -> Assignment:
+    merged = dict(left)
+    merged.update(right)
+    return merged
+
+
+def rank_assignments(
+    bqm: dimod.BinaryQuadraticModel,
+    assignments: Iterable[Assignment],
+    k: int,
+) -> List[Candidate]:
+    ranked: List[Candidate] = []
+    seen = set()
+    for assignment in assignments:
+        key = tuple(sorted(assignment.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        ranked.append({"sample": assignment, "energy": float(bqm.energy(assignment))})
+    ranked.sort(key=lambda item: item["energy"])
+    return ranked[:k]
+
+
+def count_active_positive_couplings(
+    full_bqm: dimod.BinaryQuadraticModel, assignment: Assignment
+) -> Tuple[int, float]:
+    coupling_count = 0
+    coupling_weight = 0.0
+    for (u, v), weight in full_bqm.quadratic.items():
+        if float(weight) <= 0:
+            continue
+        if int(assignment.get(u, 0)) == 1 and int(assignment.get(v, 0)) == 1:
+            coupling_count += 1
+            coupling_weight += float(weight)
+    return coupling_count, coupling_weight
+
+
+def make_cluster_key(ids: Iterable[int]) -> str:
+    return "-".join(str(value) for value in sorted(ids))
+
+
+def find_child_clusters(
+    cluster_ids: Iterable[int], clusters: Dict[str, Dict[str, object]]
+) -> Tuple[Dict[str, object], Dict[str, object]]:
+    cluster_ids = sorted(cluster_ids)
+    candidates = [
+        cluster
+        for cluster in clusters.values()
+        if all(partition_id in cluster_ids for partition_id in cluster["partition_ids"])
+    ]
+    candidates.sort(key=lambda item: len(item["partition_ids"]), reverse=True)
+    for left_index, left in enumerate(candidates):
+        for right in candidates[left_index + 1 :]:
+            if set(left["partition_ids"]) & set(right["partition_ids"]):
+                continue
+            union = sorted(left["partition_ids"] + right["partition_ids"])
+            if union == cluster_ids:
+                return left, right
+    raise ValueError(f"Could not resolve merge children for cluster {cluster_ids}")
+
+
+def get_fusion_leaf_order(
+    partitions: List[Dict[str, object]],
+    merge_steps: List[Dict[str, object]],
+) -> List[int]:
+    clusters: Dict[str, Dict[str, object]] = {
+        make_cluster_key([partition["id"]]): {
+            "partition_ids": [partition["id"]],
+            "leaf_order": [partition["id"]],
+        }
+        for partition in partitions
+    }
+    for step in merge_steps:
+        cluster_ids = sorted(step["cluster"])
+        left_cluster, right_cluster = find_child_clusters(cluster_ids, clusters)
+        clusters[make_cluster_key(cluster_ids)] = {
+            "partition_ids": cluster_ids,
+            "leaf_order": left_cluster["leaf_order"] + right_cluster["leaf_order"],
+        }
+
+    root_key = make_cluster_key(partition["id"] for partition in partitions)
+    if root_key not in clusters:
+        raise RuntimeError("Fusion tree does not contain all partitions.")
+    return list(clusters[root_key]["leaf_order"])
+
+
+def execute_tree_fusion(
+    qubo: Dict[str, object],
+    partitions: List[Dict[str, object]],
+    merge_steps: List[Dict[str, object]],
+    merge_strategy: str,
+    merge_order: str,
+    k: int = 2,
+    num_reads: int = 20,
+) -> Dict[str, Any]:
+    validate_sampling_parameters(k, num_reads)
+    full_bqm = build_bqm_from_qubo(qubo)
+    clusters: Dict[str, Dict[str, object]] = {}
+    execution_steps: List[Dict[str, Any]] = []
+    total_initial_sample_ms = 0.0
+    total_conditioned_sample_ms = 0.0
+    total_fusion_ms = 0.0
+    initial_sampling_calls = 0
+    conditioned_resampling_calls = 0
+
+    with DWaveSampler() as raw_sampler:
+        solver_id = get_solver_id(raw_sampler)
+        sampler = EmbeddingComposite(raw_sampler)
+
+        if merge_strategy == "conditioned_fusion":
+            partitions_by_id = {partition["id"]: partition for partition in partitions}
+            accumulated_sample: Assignment = {}
+            accumulated_variables: List[Any] = []
+            partition_order = get_fusion_leaf_order(partitions, merge_steps)
+            for position, partition_id in enumerate(partition_order):
+                partition = partitions_by_id[partition_id]
+                scope = list(partition["nodes"])
+                block_fusion_ms = 0.0
+                if position == 0:
+                    sample_bqm = build_induced_bqm(full_bqm, scope)
+                    sampling_kind = "initial"
+                    label = f"Initial sampling: Partition {partition_id + 1}"
+                else:
+                    fusion_t0 = time.perf_counter()
+                    sample_bqm = build_conditioned_bqm(
+                        full_bqm, accumulated_sample, scope
+                    )
+                    block_fusion_ms += (time.perf_counter() - fusion_t0) * 1000.0
+                    sampling_kind = "conditioned"
+                    label = f"Conditioned sampling: Partition {partition_id + 1}"
+
+                candidates, block_sample_ms = sample_top_k(
+                    sample_bqm, sampler, k, num_reads
+                )
+                if not candidates:
+                    raise RuntimeError(
+                        f"D-Wave returned no {sampling_kind} candidates "
+                        f"for partition {partition_id + 1}."
+                    )
+
+                if position == 0:
+                    total_initial_sample_ms += block_sample_ms
+                    initial_sampling_calls += 1
+                else:
+                    total_conditioned_sample_ms += block_sample_ms
+                    conditioned_resampling_calls += 1
+
+                fusion_t0 = time.perf_counter()
+                accumulated_variables.extend(scope)
+                accumulated_candidates = rank_assignments(
+                    build_induced_bqm(full_bqm, accumulated_variables),
+                    (
+                        merge_samples(accumulated_sample, candidate["sample"])
+                        for candidate in candidates
+                    ),
+                    1,
+                )
+                accumulated_sample = accumulated_candidates[0]["sample"]
+                selected_block_sample = {
+                    variable: accumulated_sample[variable] for variable in scope
+                }
+                block_fusion_ms += (time.perf_counter() - fusion_t0) * 1000.0
+                total_fusion_ms += block_fusion_ms
+                clusters[make_cluster_key([partition_id])] = {
+                    "partition_ids": [partition_id],
+                    "variables": scope,
+                    "candidates": [
+                        {
+                            "sample": selected_block_sample,
+                            "energy": float(sample_bqm.energy(selected_block_sample)),
+                        }
+                    ],
+                }
+                execution_steps.append(
+                    {
+                        "label": label,
+                        "type": "sampling",
+                        "sampling_kind": sampling_kind,
+                        "runtime_ms": round(block_sample_ms + block_fusion_ms, 2),
+                        "sample_ms": round(block_sample_ms, 2),
+                        "fusion_ms": round(block_fusion_ms, 2),
+                        "scope_size": len(scope),
+                    }
+                )
+        else:
+            for partition in partitions:
+                partition_id = partition["id"]
+                scope = list(partition["nodes"])
+                sub_bqm = build_induced_bqm(full_bqm, scope)
+                candidates, sample_ms = sample_top_k(sub_bqm, sampler, k, num_reads)
+                if not candidates:
+                    raise RuntimeError(
+                        f"D-Wave returned no candidates for "
+                        f"partition {partition_id + 1}."
+                    )
+                total_initial_sample_ms += sample_ms
+                initial_sampling_calls += 1
+                clusters[make_cluster_key([partition_id])] = {
+                    "partition_ids": [partition_id],
+                    "variables": scope,
+                    "candidates": candidates,
+                }
+                execution_steps.append(
+                    {
+                        "label": f"Sample Partition {partition_id + 1}",
+                        "type": "sampling",
+                        "sampling_kind": "initial",
+                        "runtime_ms": round(sample_ms, 2),
+                        "sample_ms": round(sample_ms, 2),
+                        "fusion_ms": 0.0,
+                        "scope_size": len(scope),
+                    }
+                )
+
+        for step_index, step in enumerate(merge_steps, start=1):
+            cluster_ids = sorted(step["cluster"])
+            left_cluster, right_cluster = find_child_clusters(cluster_ids, clusters)
+            fusion_t0 = time.perf_counter()
+            cluster_vars = sorted(
+                set(left_cluster["variables"]) | set(right_cluster["variables"])
+            )
+            cluster_bqm = build_induced_bqm(full_bqm, cluster_vars)
+            if merge_strategy == "direct_fusion":
+                merged_assignments = [
+                    merge_samples(
+                        left_cluster["candidates"][0]["sample"],
+                        right_cluster["candidates"][0]["sample"],
+                    )
+                ]
+                merged_candidates = rank_assignments(cluster_bqm, merged_assignments, 1)
+            elif merge_strategy == "top2_merge":
+                merged_assignments = []
+                for left_candidate in left_cluster["candidates"][:k]:
+                    for right_candidate in right_cluster["candidates"][:k]:
+                        merged_assignments.append(
+                            merge_samples(
+                                left_candidate["sample"], right_candidate["sample"]
+                            )
+                        )
+                merged_candidates = rank_assignments(cluster_bqm, merged_assignments, k)
+            elif merge_strategy == "conditioned_fusion":
+                merged_assignments = [
+                    merge_samples(
+                        left_cluster["candidates"][0]["sample"],
+                        right_cluster["candidates"][0]["sample"],
+                    )
+                ]
+                merged_candidates = rank_assignments(cluster_bqm, merged_assignments, 1)
+            else:
+                raise ValueError(f"Unknown merge strategy: {merge_strategy}")
+            fusion_ms = (time.perf_counter() - fusion_t0) * 1000.0
+            total_fusion_ms += fusion_ms
+
+            best_candidate = merged_candidates[0]
+            active_coupling_count, _ = count_active_positive_couplings(
+                cluster_bqm, best_candidate["sample"]
+            )
+            reported_fusion_ms = round(fusion_ms, 2)
+            reported_step_runtime_ms = reported_fusion_ms
+            execution_steps.append(
+                {
+                    "label": f"Merge [{', '.join(f'P{pid + 1}' for pid in left_cluster['partition_ids'])}] with [{', '.join(f'P{pid + 1}' for pid in right_cluster['partition_ids'])}]",
+                    "type": "fusion",
+                    "runtime_ms": reported_step_runtime_ms,
+                    "fusion_ms": reported_fusion_ms,
+                    "sample_ms": 0.0,
+                    "scope_size": len(cluster_vars),
+                    "energy": round(best_candidate["energy"], 4),
+                    "active_positive_coupling_count": active_coupling_count,
+                }
+            )
+
+            clusters[make_cluster_key(cluster_ids)] = {
+                "partition_ids": cluster_ids,
+                "variables": cluster_vars,
+                "candidates": merged_candidates,
+            }
+
+    root_key = make_cluster_key(partition["id"] for partition in partitions)
+    if root_key not in clusters:
+        raise RuntimeError("Fusion tree execution did not produce a root cluster.")
+
+    final_candidate = clusters[root_key]["candidates"][0]
+    final_assignment = final_candidate["sample"]
+    final_energy = float(full_bqm.energy(final_assignment))
+    active_coupling_count, active_coupling_weight = count_active_positive_couplings(
+        full_bqm, final_assignment
+    )
+    total_sample_ms = total_initial_sample_ms + total_conditioned_sample_ms
+    reported_sample_ms = round(total_sample_ms, 2)
+    reported_fusion_ms = round(total_fusion_ms, 2)
+    reported_total_runtime_ms = round(reported_sample_ms + reported_fusion_ms, 2)
+    execution_steps.append(
+        {
+            "label": "Final merged assignment",
+            "type": "result",
+            "runtime_ms": reported_total_runtime_ms,
+            "sample_ms": reported_sample_ms,
+            "fusion_ms": reported_fusion_ms,
+            "energy": round(final_energy, 4),
+            "active_positive_coupling_count": active_coupling_count,
+        }
+    )
+
+    return {
+        "strategy": merge_strategy,
+        "merge_order": merge_order,
+        "energy": final_energy,
+        "active_positive_coupling_count": active_coupling_count,
+        "active_positive_coupling_weight": round(active_coupling_weight, 4),
+        "candidate_limit": k,
+        "num_reads": num_reads,
+        "solver_id": solver_id,
+        "ocean_versions": get_ocean_versions(),
+        "sample_ms": reported_sample_ms,
+        "initial_sample_ms": round(total_initial_sample_ms, 2),
+        "conditioned_sample_ms": round(total_conditioned_sample_ms, 2),
+        "fusion_ms": reported_fusion_ms,
+        "total_runtime_ms": reported_total_runtime_ms,
+        "initial_sampling_calls": initial_sampling_calls,
+        "conditioned_resampling_calls": conditioned_resampling_calls,
+        "sampling_calls": initial_sampling_calls + conditioned_resampling_calls,
+        "assignment_size": len(final_assignment),
+        "execution_steps": execution_steps,
+    }
